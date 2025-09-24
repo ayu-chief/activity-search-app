@@ -10,7 +10,6 @@ import gspread
 from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 
-# 検索系
 from sentence_transformers import SentenceTransformer, util
 from rank_bm25 import BM25Okapi
 import numpy as np
@@ -39,8 +38,8 @@ creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPE
 gc = gspread.authorize(creds)
 st.info(f"Service Account: {creds.service_account_email}")
 
-# レート制限対策（広め）
-BASE_WAIT = 5.0   # スプレッドシート間の待機（秒）
+# レート制限対策（広め推奨）
+BASE_WAIT = 8.0   # スプレッドシート間の待機（秒）
 MAX_RETRY = 6     # 429時の最大リトライ回数
 
 # -----------------------------------------------------------------------------
@@ -76,8 +75,11 @@ def parse_sheet(values: List[List[str]]) -> Dict[str, str]:
     rec = {}
     for lab in LABELS:
         rec[lab] = extract_value(values, lab)
+
+    # 子ども/子供 を統一
     if not rec.get("子供たちの反応"):
         rec["子供たちの反応"] = rec.get("子どもたちの反応", "")
+
     out = {
         "校舎名": rec.get("校舎名", ""),
         "コンテンツ名": rec.get("コンテンツ名", ""),
@@ -90,14 +92,17 @@ def parse_sheet(values: List[List[str]]) -> Dict[str, str]:
         "良かった点": rec.get("良かった点", ""),
         "改善点": rec.get("改善点", ""),
     }
+
+    # 主要フィールドが空なら保険として全セル連結
     if not any(out.values()):
         flat = " ".join([" ".join([str(c) for c in r if str(c).strip()]) for r in values])
         out["コンテンツ名"] = out["コンテンツ名"] or "(名称未設定)"
         out["テーマ"] = flat[:200]
+
     return out
 
 # -----------------------------------------------------------------------------
-# 429回避：worksheets()を使わず、metadata(title)→values.batchGet
+# 429回避：worksheets() を使わず、metadata(title)→values.batchGet
 # -----------------------------------------------------------------------------
 def open_sheet_by_id(sid: str):
     for attempt in range(MAX_RETRY):
@@ -121,14 +126,15 @@ def open_sheet_by_id(sid: str):
             return None
 
 @st.cache_data(show_spinner=True, ttl=6*60*60)
-def load_all_data(_version:int=2) -> pd.DataFrame:
+def load_all_data_v2() -> pd.DataFrame:
+    """worksheets()は使わず、タイトルだけ取得→values.batchGetで一括取得"""
     rows = []
     for sid in SPREADSHEET_IDS:
         sh = open_sheet_by_id(sid)
         if not sh:
             continue
 
-        # 1) 軽量メタデータ取得（タイトルだけ）
+        # 1) タイトルのみ軽量取得
         meta = None
         for attempt in range(MAX_RETRY):
             try:
@@ -150,12 +156,11 @@ def load_all_data(_version:int=2) -> pd.DataFrame:
                 st.code(str(e))
                 meta = None
                 break
-
         if not meta:
             continue
 
         titles = [s["properties"]["title"] for s in meta.get("sheets", []) if "properties" in s]
-        # 使う列幅を必要最小限に（A:Q など必要に応じて調整）
+        # 読み取り列幅（必要なら狭める：A:N など）
         ranges = [f"'{t}'!A:Q" for t in titles]
 
         # 2) 一括取得（values.batchGet）
@@ -181,7 +186,6 @@ def load_all_data(_version:int=2) -> pd.DataFrame:
                 st.code(str(e))
                 vals_resp = None
                 break
-
         if not vals_resp:
             continue
 
@@ -239,19 +243,19 @@ st.title("🎯 活動コンテンツ検索")
 
 with st.sidebar:
     st.header("検索設定")
-    alpha = st.slider("意味重視（1.0） ←→ 語一致重視（0.0）", min_value=0.0, max_value=1.0, value=0.7, step=0.05)
+    alpha = st.slider("意味重視（1.0） ←→ 語一致重視（0.0）", 0.0, 1.0, 0.7, 0.05)
     top_k = st.slider("件数", 5, 50, 15)
     st.caption("※初回は読み込みに時間がかかります（キャッシュ後は速くなります）")
 
-# データ読み込み
+# データ読み込み（v2を必ず呼ぶ）
 with st.spinner("シートを読み込んでいます…"):
-    df = load_all_data(_version=2)
+    df = load_all_data_v2()
 
 st.write(f"📄 読み込めたレコード数: {len(df)}")
 if len(df) == 0:
     st.stop()
 
-# 検索コーパス準備
+# 検索コーパス
 corpus_texts = (df["検索用テキスト"].fillna("") + " " + df["コンテンツ名"].fillna("")).tolist()
 corpus_tokens = [tokenize_ja(t) for t in corpus_texts]
 bm25 = build_bm25(corpus_tokens)
@@ -261,22 +265,18 @@ corpus_emb = embedder.encode(corpus_texts, normalize_embeddings=True, show_progr
 # 検索フォーム
 q = st.text_input("キーワードを入力（例：発表練習 / グループ活動 / 表現力 など）", "")
 if q:
-    # 同義語展開
     expanded = [q]
     for k, vs in SYNONYMS.items():
         if k in q:
             expanded += vs
     q_expanded = " ".join(expanded)
 
-    # BM25
     q_toks = tokenize_ja(q_expanded)
     bm25_scores = bm25.get_scores(q_toks)
 
-    # 埋め込み類似
     q_emb = embedder.encode([q_expanded], normalize_embeddings=True, show_progress_bar=False)
     sem_scores = util.cos_sim(q_emb, corpus_emb).cpu().numpy()[0]
 
-    # 正規化（0-1）
     def minmax(x):
         x = np.array(x, dtype=float)
         if x.max() - x.min() < 1e-9:
@@ -284,10 +284,8 @@ if q:
         return (x - x.min()) / (x.max() - x.min())
 
     bm25_n = minmax(bm25_scores)
-    sem_n = minmax(sem_scores)
-
-    # 融合
-    final = alpha * sem_n + (1 - alpha) * bm25_n
+    sem_n  = minmax(sem_scores)
+    final  = alpha * sem_n + (1 - alpha) * bm25_n
     idx = np.argsort(final)[::-1][:top_k]
 
     st.subheader("検索結果")
