@@ -6,6 +6,12 @@ from google.oauth2.service_account import Credentials
 from sentence_transformers import SentenceTransformer, util
 from rank_bm25 import BM25Okapi
 import re, unicodedata
+import time
+from gspread.exceptions import APIError
+
+# 1分あたりの上限を踏まえて最低待ち時間を確保
+BASE_WAIT = 1.1      # 1回の呼び出し間隔（秒）
+MAX_RETRY = 5        # 429時の最大リトライ回数
 
 st.set_page_config(page_title="🎯 活動コンテンツ検索", layout="wide")
 
@@ -23,23 +29,29 @@ creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPE
 gc = gspread.authorize(creds)
 st.info(f"Service Account: {creds.service_account_email}")
 
-# ============ デバッグ用：1つずつ開いてみる ============
+# ============ デバッグ用：1つずつ開いてみる（429に強い版） ============
 def open_sheet_by_id(sid: str):
-    try:
-        sh = gc.open_by_key(sid)
-        st.success(f"✅ Opened: {sh.title} ({sid})")
-        return sh
-    except APIError as e:
-        resp = getattr(e, "response", None)
-        code = getattr(resp, "status_code", "?")
-        text = getattr(resp, "text", str(e))
-        st.error(f"❌ Failed to open (status={code}): {sid}")
-        st.code(text[:2000])
-        return None
-    except Exception as e:
-        st.error(f"❌ Failed to open (unexpected): {sid}")
-        st.code(str(e))
-        return None
+    for attempt in range(MAX_RETRY):
+        try:
+            sh = gc.open_by_key(sid)
+            st.success(f"✅ Opened: {sh.title} ({sid})")
+            return sh
+        except APIError as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code == 429 and attempt < MAX_RETRY - 1:
+                wait = BASE_WAIT * (2 ** attempt)  # 指数バックオフ
+                st.warning(f"⏳ Rate limit: open_by_key (retry {attempt+1}/{MAX_RETRY}) in {wait:.1f}s")
+                time.sleep(wait)
+                continue
+            # 429以外 or リトライ打ち止め
+            text = getattr(getattr(e, "response", None), "text", str(e))
+            st.error(f"❌ Failed to open (status={code}): {sid}")
+            st.code(text[:2000])
+            return None
+        except Exception as e:
+            st.error(f"❌ Failed to open (unexpected): {sid}")
+            st.code(str(e))
+            return None
 
 def load_all_data_no_cache():
     rows = []
@@ -47,18 +59,40 @@ def load_all_data_no_cache():
         sh = open_sheet_by_id(sid)
         if not sh:
             continue  # 失敗したIDは飛ばして次へ
+
         for ws in sh.worksheets():
-            try:
-                vals = ws.get_all_values()
-            except Exception as e:
-                st.error(f"❌ Failed to read values: {sh.title} / {ws.title}")
-                st.code(str(e))
-                continue
+            # リクエスト間隔を必ず空ける
+            time.sleep(BASE_WAIT)
+
+            vals = None
+            for attempt in range(MAX_RETRY):
+                try:
+                    vals = ws.get_all_values()
+                    break
+                except APIError as e:
+                    code = getattr(getattr(e, "response", None), "status_code", None)
+                    if code == 429 and attempt < MAX_RETRY - 1:
+                        wait = BASE_WAIT * (2 ** attempt)
+                        st.warning(f"⏳ Rate limit: get_all_values('{ws.title}') (retry {attempt+1}/{MAX_RETRY}) in {wait:.1f}s")
+                        time.sleep(wait)
+                        continue
+                    st.error(f"❌ Failed to read values: {sh.title} / {ws.title} (status={code})")
+                    st.code(getattr(getattr(e, 'response', None), 'text', str(e))[:2000])
+                    vals = []
+                    break
+                except Exception as e:
+                    st.error(f"❌ Failed to read values: {sh.title} / {ws.title}")
+                    st.code(str(e))
+                    vals = []
+                    break
+
             if not vals:
                 continue
-            rec = parse_sheet(vals)  # ← 既存のパーサーを利用
+
+            rec = parse_sheet(vals)  # 既存のパーサー
             if not any(rec.values()):
                 continue
+
             rec["スプレッドシート"] = sh.title
             rec["ファイルID"] = sid
             rec["シート名"] = ws.title
@@ -68,6 +102,7 @@ def load_all_data_no_cache():
                 rec.get("子供たちの反応",""), rec.get("良かった点",""), rec.get("改善点","")
             ]).strip()
             rows.append(rec)
+
     return pd.DataFrame(rows)
 
 # =========================
@@ -357,6 +392,7 @@ for i, total, s_sem, s_bm in results:
 
 if shown == 0:
     st.info("該当がフィルタで除外されました。フィルタや件数を調整してください。")
+
 
 
 
