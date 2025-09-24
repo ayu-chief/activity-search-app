@@ -1,22 +1,28 @@
+# app.py
+import time
+import re
+import unicodedata
+from typing import List, Dict
+
 import streamlit as st
 import pandas as pd
 import gspread
 from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
+
+# 検索系
 from sentence_transformers import SentenceTransformer, util
 from rank_bm25 import BM25Okapi
-import re, unicodedata
-import time
-from gspread.exceptions import APIError
 
-# 1分あたりの上限を踏まえて最低待ち時間を確保
-BASE_WAIT = 1.1      # 1回の呼び出し間隔（秒）
-MAX_RETRY = 5        # 429時の最大リトライ回数
-
+# -----------------------------------------------------------------------------
+# 基本設定
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="🎯 活動コンテンツ検索", layout="wide")
 
-# ============ Google Sheets 接続 ============
-SERVICE_ACCOUNT_INFO = st.secrets["google_service_account"]
+# -----------------------------------------------------------------------------
+# Google Sheets 接続
+# -----------------------------------------------------------------------------
+SERVICE_ACCOUNT_INFO = st.secrets["google_service_account"]  # Secretsに入れたJSON
 SPREADSHEET_IDS = [
     "1GCenO3IlDFrSITj1r90G_Vz_11D66POc8ny9HMtdCcM",
     "1Rjkgc6whTpg4FKUNLVSdzFSya-_tg42Wg4e10p-MmmI",
@@ -24,12 +30,83 @@ SPREADSHEET_IDS = [
     "1p4utUR9of_uSQNpzwJpSXgKiPrNur5nSTgHZvrbwmuc",
     "1HULvSdUAdSNdXXhPshu4mfwraf-bNq6zakFRhKF4Yfg",
 ]
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
 gc = gspread.authorize(creds)
 st.info(f"Service Account: {creds.service_account_email}")
 
-# ============ デバッグ用：1つずつ開いてみる（429に強い版） ============
+# レート制限対策用
+BASE_WAIT = 1.1   # シート間の最小待機（秒）
+MAX_RETRY = 5     # 429時の最大リトライ回数
+
+
+# -----------------------------------------------------------------------------
+# 正規化ヘルパ
+# -----------------------------------------------------------------------------
+def normalize(s: str) -> str:
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", str(s))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+# -----------------------------------------------------------------------------
+# シート1枚 → レコード化（ラベル取り出し）
+# -----------------------------------------------------------------------------
+LABELS = [
+    "校舎名", "コンテンツ名", "テーマ", "対象生徒", "対象", "参加人数",
+    "準備物", "実施方法", "子供たちの反応", "子どもたちの反応", "良かった点", "改善点",
+]
+
+def extract_value(values: List[List[str]], label: str) -> str:
+    lab = normalize(label)
+    for row in values:
+        for j, cell in enumerate(row):
+            if lab and lab in normalize(cell):
+                right = row[j+1:] if j+1 < len(row) else []
+                toks = [c for c in right if str(c).strip()]
+                if toks:
+                    return " ".join(normalize(c) for c in toks).strip()
+    return ""
+
+def parse_sheet(values: List[List[str]]) -> Dict[str, str]:
+    rec = {}
+    for lab in LABELS:
+        rec[lab] = extract_value(values, lab)
+
+    # 子ども/子供 を統一
+    if not rec.get("子供たちの反応"):
+        rec["子供たちの反応"] = rec.get("子どもたちの反応", "")
+
+    out = {
+        "校舎名": rec.get("校舎名", ""),
+        "コンテンツ名": rec.get("コンテンツ名", ""),
+        "テーマ": rec.get("テーマ", ""),
+        "対象": rec.get("対象生徒", "") or rec.get("対象", ""),
+        "参加人数": rec.get("参加人数", ""),
+        "準備物": rec.get("準備物", ""),
+        "実施方法": rec.get("実施方法", ""),
+        "子供たちの反応": rec.get("子供たちの反応", ""),
+        "良かった点": rec.get("良かった点", ""),
+        "改善点": rec.get("改善点", ""),
+    }
+
+    # 主要フィールドが空なら保険として全セル連結
+    if not any(out.values()):
+        flat = " ".join([" ".join([str(c) for c in r if str(c).strip()]) for r in values])
+        out["コンテンツ名"] = out["コンテンツ名"] or "(名称未設定)"
+        out["テーマ"] = flat[:200]
+
+    return out
+
+
+# -----------------------------------------------------------------------------
+# 429を避ける：スプレッドシート単位で batchGet するローダ
+# -----------------------------------------------------------------------------
 def open_sheet_by_id(sid: str):
     for attempt in range(MAX_RETRY):
         try:
@@ -39,63 +116,77 @@ def open_sheet_by_id(sid: str):
         except APIError as e:
             code = getattr(getattr(e, "response", None), "status_code", None)
             if code == 429 and attempt < MAX_RETRY - 1:
-                wait = BASE_WAIT * (2 ** attempt)  # 指数バックオフ
+                wait = BASE_WAIT * (2 ** attempt)
                 st.warning(f"⏳ Rate limit: open_by_key (retry {attempt+1}/{MAX_RETRY}) in {wait:.1f}s")
                 time.sleep(wait)
                 continue
-            # 429以外 or リトライ打ち止め
-            text = getattr(getattr(e, "response", None), "text", str(e))
             st.error(f"❌ Failed to open (status={code}): {sid}")
-            st.code(text[:2000])
+            st.code(getattr(getattr(e, "response", None), "text", str(e))[:2000])
             return None
         except Exception as e:
             st.error(f"❌ Failed to open (unexpected): {sid}")
             st.code(str(e))
             return None
 
-def load_all_data_no_cache():
+@st.cache_data(show_spinner=True, ttl=6*60*60)  # 6時間キャッシュ
+def load_all_data() -> pd.DataFrame:
+    """
+    各スプレッドシートについて values.batchGet で全ワークシートを一括取得。
+    ＝ リクエスト回数を「シート数」→「スプレッドシート数」に圧縮。
+    """
     rows = []
     for sid in SPREADSHEET_IDS:
         sh = open_sheet_by_id(sid)
         if not sh:
-            continue  # 失敗したIDは飛ばして次へ
+            continue
 
-        for ws in sh.worksheets():
-            # リクエスト間隔を必ず空ける
-            time.sleep(BASE_WAIT)
+        # 使う列幅を必要に応じて狭める（A:Q など）
+        ranges = [f"'{ws.title}'!A:Z" for ws in sh.worksheets()]
 
-            vals = None
-            for attempt in range(MAX_RETRY):
-                try:
-                    vals = ws.get_all_values()
-                    break
-                except APIError as e:
-                    code = getattr(getattr(e, "response", None), "status_code", None)
-                    if code == 429 and attempt < MAX_RETRY - 1:
-                        wait = BASE_WAIT * (2 ** attempt)
-                        st.warning(f"⏳ Rate limit: get_all_values('{ws.title}') (retry {attempt+1}/{MAX_RETRY}) in {wait:.1f}s")
-                        time.sleep(wait)
-                        continue
-                    st.error(f"❌ Failed to read values: {sh.title} / {ws.title} (status={code})")
-                    st.code(getattr(getattr(e, 'response', None), 'text', str(e))[:2000])
-                    vals = []
-                    break
-                except Exception as e:
-                    st.error(f"❌ Failed to read values: {sh.title} / {ws.title}")
-                    st.code(str(e))
-                    vals = []
-                    break
+        time.sleep(BASE_WAIT)  # シート間の間隔
 
+        vals_resp = None
+        for attempt in range(MAX_RETRY):
+            try:
+                vals_resp = sh.values_batch_get(
+                    ranges=ranges,
+                    params={"majorDimension": "ROWS"}
+                )
+                break
+            except APIError as e:
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                if code == 429 and attempt < MAX_RETRY - 1:
+                    wait = BASE_WAIT * (2 ** attempt)
+                    st.warning(f"⏳ Rate limit: values.batchGet (retry {attempt+1}/{MAX_RETRY}) in {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                st.error(f"❌ Failed batchGet (status={code}): {sh.title}")
+                st.code(getattr(getattr(e, "response", None), "text", str(e))[:2000])
+                vals_resp = None
+                break
+            except Exception as e:
+                st.error(f"❌ Failed batchGet (unexpected): {sh.title}")
+                st.code(str(e))
+                vals_resp = None
+                break
+
+        if not vals_resp:
+            continue
+
+        for vr in vals_resp.get("valueRanges", []):
+            rng = vr.get("range", "")
+            ws_title = rng.split("!")[0].strip("'")
+            vals = vr.get("values", [])
             if not vals:
                 continue
 
-            rec = parse_sheet(vals)  # 既存のパーサー
+            rec = parse_sheet(vals)
             if not any(rec.values()):
                 continue
 
             rec["スプレッドシート"] = sh.title
             rec["ファイルID"] = sid
-            rec["シート名"] = ws.title
+            rec["シート名"] = ws_title
             rec["検索用テキスト"] = " ".join([
                 rec.get("コンテンツ名",""), rec.get("テーマ",""), rec.get("対象",""),
                 rec.get("準備物",""), rec.get("実施方法",""),
@@ -103,298 +194,116 @@ def load_all_data_no_cache():
             ]).strip()
             rows.append(rec)
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    return df
 
-# =========================
-#  ラベル形式のシートを1レコードに整形
-# =========================
-LABELS = [
-    "校舎名","コンテンツ名","テーマ","対象生徒","対象","参加人数",
-    "準備物","実施方法","子供たちの反応","子どもたちの反応","良かった点","改善点"
-]
 
-def _normalize(s):
-    import unicodedata, re
-    if not isinstance(s, str): s = "" if s is None else str(s)
-    s = unicodedata.normalize("NFKC", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def extract_value(values, label):
-    """行ラベル（左:ラベル, 右:値）を想定。見つかったら右側セルを連結して返す。"""
-    lab = _normalize(label)
-    for row in values:
-        for j, cell in enumerate(row):
-            if lab and lab in _normalize(cell):
-                right = row[j+1:] if j+1 < len(row) else []
-                toks = [c for c in right if str(c).strip()]
-                if toks:
-                    return " ".join(toks).strip()
-    return ""
-
-def parse_sheet(values):
-    """スプレッドシート1枚→辞書。ラベルが無い場合は全セルを結合して最低限返す。"""
-    rec = {}
-    for lab in LABELS:
-        rec[lab] = extract_value(values, lab)
-
-    # 子ども/子供 を統一
-    if not rec.get("子供たちの反応"):
-        rec["子供たちの反応"] = rec.get("子どもたちの反応", "")
-
-    # 表示用キーへマッピング
-    out = {
-        "校舎名": rec.get("校舎名",""),
-        "コンテンツ名": rec.get("コンテンツ名",""),
-        "テーマ": rec.get("テーマ",""),
-        "対象": rec.get("対象生徒","") or rec.get("対象",""),
-        "参加人数": rec.get("参加人数",""),
-        "準備物": rec.get("準備物",""),
-        "実施方法": rec.get("実施方法",""),
-        "子供たちの反応": rec.get("子供たちの反応",""),
-        "良かった点": rec.get("良かった点",""),
-        "改善点": rec.get("改善点",""),
-    }
-
-    # もし主要フィールドが全部空なら、全セルを繋いで最低限の検索テキストを作る
-    if not any(out.values()):
-        flat = " ".join([" ".join([str(c) for c in r if str(c).strip()]) for r in values])
-        out["コンテンツ名"] = out["コンテンツ名"] or "(名称未設定)"
-        out["テーマ"] = flat[:200]
-
-    return out
-
-# 実行（まずはデバッグログを出すことが目的）
-df = load_all_data_no_cache()
-st.write(f"📄 読み込めたレコード数: {len(df)}")
-
-# =========================
-#  テキスト正規化/トークン化
-# =========================
-def normalize_text(s: str) -> str:
-    if not isinstance(s, str):
-        return ""
-    s = unicodedata.normalize("NFKC", s).lower()
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def tokenize_ja_simple(s: str):
-    s = normalize_text(s)
-    s = re.sub(r"[、。・,./!?:;()\[\]{}「」『』￥$%^&*<>＝=＋+－\-…~―ー]", " ", s)
-    return [t for t in s.split(" ") if t]
-
-# =========================
-#  クエリ拡張（同義語）
-# =========================
-SYNONYMS = {
-    "探究": ["総合学習", "課題研究", "pbl", "プロジェクト学習"],
-    "発表": ["プレゼン", "スピーチ", "口頭発表", "ショーケース"],
-    "振り返り": ["リフレクション", "感想", "ふりかえり", "内省"],
-    "職業体験": ["キャリア教育", "職業講話", "職業探究", "ゲスト講演"],
-    "グループ活動": ["協働学習", "チーム作業", "共同作業", "班活動"],
-    "創作": ["制作", "ものづくり", "ワークショップ", "ハンドメイド"],
-    "表現": ["演劇", "朗読", "セリフ", "身体表現", "コミュニケーション"],
-}
-def expand_query(q: str) -> list[str]:
-    qn = normalize_text(q)
-    qs = {qn}
-    for k, alts in SYNONYMS.items():
-        if k in qn or any(a in qn for a in alts):
-            qs.update([normalize_text(x) for x in [k, *alts]])
-    return list(qs)
-
-# =========================
-#  シート → 1レコード抽出
-#   （ラベル行から値をかき集める）
-# =========================
-LABELS = [
-    "校舎名","コンテンツ名","テーマ","対象生徒","参加人数",
-    "準備物","実施方法","子供たちの反応","子どもたちの反応","良かった点","改善点"
-]
-
-def extract_value(values, label):
-    # シート全体から label を含むセルを探し、その行の「右側セル群」を結合して返す
-    for row in values:
-        for j, cell in enumerate(row):
-            if label in str(cell):
-                right = row[j+1:] if j+1 < len(row) else []
-                toks = [t for t in right if t and str(t).strip()]
-                if toks:
-                    return " ".join(toks).strip()
-    return ""
-
-def parse_sheet(values):
-    rec = {}
-    for lab in LABELS:
-        rec[lab] = extract_value(values, lab)
-    # 子ども/子供 どちらかで補完
-    if not rec.get("子供たちの反応"):
-        rec["子供たちの反応"] = rec.get("子どもたちの反応","")
-    # 表示用・検索用のフィールド整形
-    rec_out = {
-        "校舎名": rec.get("校舎名",""),
-        "コンテンツ名": rec.get("コンテンツ名",""),
-        "テーマ": rec.get("テーマ",""),
-        "対象": rec.get("対象生徒",""),
-        "参加人数": rec.get("参加人数",""),
-        "準備物": rec.get("準備物",""),
-        "実施方法": rec.get("実施方法",""),
-        "子供たちの反応": rec.get("子供たちの反応",""),
-        "良かった点": rec.get("良かった点",""),
-        "改善点": rec.get("改善点",""),
-    }
-    return rec_out
+# -----------------------------------------------------------------------------
+# 検索準備（埋め込み＋BM25）
+# -----------------------------------------------------------------------------
+@st.cache_resource(show_spinner=True)
+def load_embedder():
+    # 小型・多言語
+    return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
 @st.cache_data(show_spinner=False)
-def load_all_data():
-    rows = []
-    for sid in SPREADSHEET_IDS:
-        sh = gc.open_by_key(sid)
-        file_title = sh.title
-        for ws in sh.worksheets():
-            vals = ws.get_all_values()
-            if not vals:
-                continue
-            rec = parse_sheet(vals)
-            # ほぼ空のシートはスキップ
-            if not any(rec.values()):
-                continue
-            rec["スプレッドシート"] = file_title
-            rec["ファイルID"] = sid
-            rec["シート名"] = ws.title
-            # 検索用テキスト
-            rec["検索用テキスト"] = " ".join([
-                rec.get("コンテンツ名",""), rec.get("テーマ",""), rec.get("対象",""),
-                rec.get("準備物",""), rec.get("実施方法",""),
-                rec.get("子供たちの反応",""), rec.get("良かった点",""), rec.get("改善点","")
-            ]).strip()
-            rows.append(rec)
-    return pd.DataFrame(rows)
+def build_bm25(corpus_tokens: List[List[str]]):
+    return BM25Okapi(corpus_tokens)
 
-# =========================
-#  モデル&インデックス準備
-# =========================
-@st.cache_resource(show_spinner=True)
-def load_model():
-    return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-model = load_model()
+def tokenize_ja(text: str) -> List[str]:
+    # シンプルな空白・句読点分割（形態素解析なしでもそこそこ動く）
+    text = normalize(text)
+    toks = re.split(r"[ \u3000、。・,./!?！？\-\n\r\t]+", text)
+    return [t for t in toks if t]
 
-df = load_all_data()
-if df.empty:
-    st.error("データを取得できませんでした。サービスアカウントの共有権限をご確認ください。")
+SYNONYMS = {
+    "発表": ["プレゼン", "スピーチ", "表現", "発表練習"],
+    "表現": ["発表", "伝える", "アウトプット"],
+    "協力": ["協働", "チーム", "グループ", "共同"],
+    "創作": ["ものづくり", "制作", "工作", "クリエイティブ"],
+    "読解": ["読み取り", "感想", "読書", "朗読"],
+}
+
+
+# -----------------------------------------------------------------------------
+# UI
+# -----------------------------------------------------------------------------
+st.title("🎯 活動コンテンツ検索")
+
+with st.sidebar:
+    st.header("検索設定")
+    alpha = st.slider("意味重視（1.0） ←→ 語一致重視（0.0）", min_value=0.0, max_value=1.0, value=0.7, step=0.05)
+    top_k = st.slider("件数", 5, 50, 15)
+    st.caption("※初回は読み込みに時間がかかります（キャッシュ後は速くなります）")
+
+# データ読み込み
+with st.spinner("シートを読み込んでいます…"):
+    df = load_all_data()
+
+st.write(f"📄 読み込めたレコード数: {len(df)}")
+
+if len(df) == 0:
     st.stop()
 
-# 正規化コーパス
-df["検索用テキスト_norm"] = df["検索用テキスト"].map(normalize_text)
+# 検索コーパス準備
+corpus_texts = (df["検索用テキスト"].fillna("") + " " + df["コンテンツ名"].fillna("")).tolist()
+corpus_tokens = [tokenize_ja(t) for t in corpus_texts]
+bm25 = build_bm25(corpus_tokens)
+embedder = load_embedder()
+corpus_emb = embedder.encode(corpus_texts, normalize_embeddings=True, show_progress_bar=False)
 
-# 1) セマンティック埋め込み
-@st.cache_resource(show_spinner=True)
-def build_embeddings(texts: list[str]):
-    return model.encode(texts, convert_to_tensor=True)
-corpus_embeddings = build_embeddings(df["検索用テキスト_norm"].tolist())
+# 検索フォーム
+q = st.text_input("キーワードを入力（例：発表練習 / グループ活動 / 表現力 など）", "")
+if q:
+    # 同義語展開
+    expanded = [q]
+    for k, vs in SYNONYMS.items():
+        if k in q:
+            expanded += vs
+    q_expanded = " ".join(expanded)
 
-# 2) BM25
-corpus_tokens = [tokenize_ja_simple(t) for t in df["検索用テキスト_norm"].tolist()]
-bm25 = BM25Okapi(corpus_tokens)
+    # BM25
+    q_toks = tokenize_ja(q_expanded)
+    bm25_scores = bm25.get_scores(q_toks)
 
-# =========================
-#  ハイブリッド検索（必ず返す）
-# =========================
-def hybrid_search(query: str, top_k: int = 8, alpha: float = 0.7):
-    # A) セマンティック
-    q_emb = model.encode(normalize_text(query), convert_to_tensor=True)
-    sem_hits = util.semantic_search(q_emb, corpus_embeddings, top_k=max(50, top_k*5))[0]
-    sem_scores = {h["corpus_id"]: float(h["score"]) for h in sem_hits}
+    # 埋め込み類似
+    q_emb = embedder.encode([q_expanded], normalize_embeddings=True, show_progress_bar=False)
+    sem_scores = util.cos_sim(q_emb, corpus_emb).cpu().numpy()[0]
 
-    # B) クエリ拡張 + BM25（最大値で統合）
-    bm25_scores = {}
-    for qx in (expand_query(query) or [query]):
-        toks = tokenize_ja_simple(qx)
-        scores = bm25.get_scores(toks)
-        for i, s in enumerate(scores):
-            bm25_scores[i] = max(bm25_scores.get(i, 0.0), float(s))
+    # 正規化（0-1）
+    import numpy as np
+    def minmax(x):
+        x = np.array(x, dtype=float)
+        if x.max() - x.min() < 1e-9:
+            return np.zeros_like(x)
+        return (x - x.min()) / (x.max() - x.min())
 
-    # C) BM25スコア正規化
-    max_bm = max(bm25_scores.values(), default=1.0) or 1.0
-    bm25_scores = {i: s / max_bm for i, s in bm25_scores.items()}
+    bm25_n = minmax(bm25_scores)
+    sem_n = minmax(sem_scores)
 
-    # D) 結合（しきい値で弾かない）
-    all_ids = set(sem_scores) | set(bm25_scores)
-    merged = []
-    for i in all_ids:
-        s_sem = sem_scores.get(i, 0.0)
-        s_bm  = bm25_scores.get(i, 0.0)
-        score = alpha * s_sem + (1 - alpha) * s_bm
-        merged.append((i, score, s_sem, s_bm))
-    merged.sort(key=lambda x: x[1], reverse=True)
-    return merged[:top_k]
+    # 融合
+    final = alpha * sem_n + (1 - alpha) * bm25_n
+    idx = np.argsort(final)[::-1][:top_k]
 
-# =========================
-#  UI
-# =========================
-st.markdown("""
-<div style='background:#e3f3ec;padding:16px;border-radius:8px'>
-  <h2 style='margin:0'>🎯 活動コンテンツ検索</h2>
-  <p style='margin:4px 0 0'>語が含まれていなくても、意味が近い活動を必ず提示します。</p>
-</div>
-""", unsafe_allow_html=True)
-st.write("")
+    st.subheader("検索結果")
+    for rank, i in enumerate(idx, start=1):
+        row = df.iloc[i]
+        url = f"https://docs.google.com/spreadsheets/d/{row['ファイルID']}/edit"
+        with st.container(border=True):
+            st.markdown(f"**{rank}. {row.get('コンテンツ名','(名称未設定)')}** 　[{row['スプレッドシート']} / {row['シート名']}]({url})")
+            cols = st.columns(3)
+            with cols[0]:
+                st.write("**テーマ**:", row.get("テーマ",""))
+                st.write("**対象**:", row.get("対象",""))
+                st.write("**参加人数**:", row.get("参加人数",""))
+            with cols[1]:
+                st.write("**準備物**:", row.get("準備物",""))
+                st.write("**実施方法**:", row.get("実施方法",""))
+            with cols[2]:
+                st.write("**子供たちの反応**:", row.get("子供たちの反応",""))
+                st.write("**良かった点**:", row.get("良かった点",""))
+                st.write("**改善点**:", row.get("改善点",""))
+            st.caption(f"score={final[i]:.3f} / semantic={sem_n[i]:.3f} / bm25={bm25_n[i]:.3f}")
 
-col1, col2, col3 = st.columns([3,1,1])
-with col1:
-    query = st.text_input("キーワードや目的（例：発表練習 / 物語体験 / グループ活動 など）", "")
-with col2:
-    top_k = st.number_input("件数", 1, 20, 6)
-with col3:
-    alpha = st.slider("意味重視↔語一致", 0.0, 1.0, 0.7, 0.05)
-
-# 対象フィルタ（任意）
-targets = st.multiselect("対象で絞り込み（任意）", ["小", "中", "高"])
-
-def pass_target_filter(text):
-    if not targets:
-        return True
-    t = text or ""
-    return all(any(tag in t for tag in targets) for tag in targets)
-
-if query:
-    results = hybrid_search(query, top_k=top_k, alpha=alpha)
-    st.caption("検索方式: Semantic + BM25 + クエリ拡張（しきい値なし・必ず提案）")
 else:
-    # 未入力時はおすすめ表示
-    results = [(i, 0.0, 0.0, 0.0) for i in df.sample(min(top_k, len(df)), random_state=0).index]
-    st.caption("未入力のため、ランダムにおすすめを表示中")
-
-shown = 0
-for i, total, s_sem, s_bm in results:
-    row = df.iloc[i]
-    if not pass_target_filter(row.get("対象","")):
-        continue
-    st.markdown(f"### 📌 {row.get('コンテンツ名','(名称未設定)')}　—　{row.get('シート名','')}")
-    if query:
-        st.progress(min(1.0, total))
-        st.caption(f"(semantic: {s_sem:.2f} / bm25: {s_bm:.2f} / total: {total:.2f})")
-    cols = st.columns(3)
-    with cols[0]:
-        st.write(f"**テーマ:** {row.get('テーマ','')}")
-        st.write(f"**対象:** {row.get('対象','')}")
-        st.write(f"**参加人数:** {row.get('参加人数','')}")
-    with cols[1]:
-        st.write(f"**準備物:** {row.get('準備物','')}")
-        st.write(f"**良かった点:** {row.get('良かった点','')}")
-    with cols[2]:
-        st.write(f"**実施方法:** {row.get('実施方法','')}")
-        st.write(f"**子供たちの反応:** {row.get('子供たちの反応','')}")
-        st.write(f"**改善点:** {row.get('改善点','')}")
-    st.caption(f"📄 {row.get('スプレッドシート','')} / シート: {row.get('シート名','')}")
-    st.divider()
-    shown += 1
-
-if shown == 0:
-    st.info("該当がフィルタで除外されました。フィルタや件数を調整してください。")
-
-
-
-
-
-
+    st.info("検索語を入力してください。例：**発表練習**, **グループ活動**, **朗読**, **工作**, **表現力** など")
