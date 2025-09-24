@@ -39,8 +39,8 @@ gc = gspread.authorize(creds)
 st.info(f"Service Account: {creds.service_account_email}")
 
 # レート制限対策用
-BASE_WAIT = 1.1   # シート間の最小待機（秒）
-MAX_RETRY = 5     # 429時の最大リトライ回数
+BASE_WAIT = 5.0   # スプレッドシート間の待機（秒）
+MAX_RETRY = 6     # 429時の最大リトライ回数
 
 
 # -----------------------------------------------------------------------------
@@ -108,6 +108,7 @@ def parse_sheet(values: List[List[str]]) -> Dict[str, str]:
 # 429を避ける：スプレッドシート単位で batchGet するローダ
 # -----------------------------------------------------------------------------
 def open_sheet_by_id(sid: str):
+    """スプレッドシートを開く（429は指数バックオフで再試行）"""
     for attempt in range(MAX_RETRY):
         try:
             sh = gc.open_by_key(sid)
@@ -128,11 +129,12 @@ def open_sheet_by_id(sid: str):
             st.code(str(e))
             return None
 
-@st.cache_data(show_spinner=True, ttl=6*60*60)  # 6時間キャッシュ
+@st.cache_data(show_spinner=True, ttl=6*60*60)
 def load_all_data() -> pd.DataFrame:
     """
-    各スプレッドシートについて values.batchGet で全ワークシートを一括取得。
-    ＝ リクエスト回数を「シート数」→「スプレッドシート数」に圧縮。
+    - worksheets() を使わず、メタデータを fields 指定で軽量取得
+    - そのタイトルから ranges を作り、values.batchGet で一括取得
+    - すべてのAPI呼び出しに指数バックオフ付き
     """
     rows = []
     for sid in SPREADSHEET_IDS:
@@ -140,11 +142,40 @@ def load_all_data() -> pd.DataFrame:
         if not sh:
             continue
 
-        # 使う列幅を必要に応じて狭める（A:Q など）
-        ranges = [f"'{ws.title}'!A:Z" for ws in sh.worksheets()]
+        # ---- 1) シート一覧（タイトル）を軽量に取得
+        meta = None
+        for attempt in range(MAX_RETRY):
+            try:
+                # タイトルだけ取得（fields を絞るのがポイント）
+                meta = sh.fetch_sheet_metadata(params={"fields": "sheets(properties(title))"})
+                break
+            except APIError as e:
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                if code == 429 and attempt < MAX_RETRY - 1:
+                    wait = BASE_WAIT * (2 ** attempt)
+                    st.warning(f"⏳ Rate limit: fetch_sheet_metadata (retry {attempt+1}/{MAX_RETRY}) in {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                st.error(f"❌ Failed to fetch metadata (status={code}): {sh.title}")
+                st.code(getattr(getattr(e, "response", None), "text", str(e))[:2000])
+                meta = None
+                break
+            except Exception as e:
+                st.error(f"❌ Failed to fetch metadata (unexpected): {sh.title}")
+                st.code(str(e))
+                meta = None
+                break
 
-        time.sleep(BASE_WAIT)  # シート間の間隔
+        if not meta:
+            continue
 
+        sheet_titles = [s["properties"]["title"] for s in meta.get("sheets", []) if "properties" in s]
+
+        # 読みたい列幅を狭める（必要に合わせて変更。A:Q 推奨）
+        ranges = [f"'{title}'!A:Q" for title in sheet_titles]
+
+        # ---- 2) データ一括取得（values.batchGet）
+        time.sleep(BASE_WAIT)
         vals_resp = None
         for attempt in range(MAX_RETRY):
             try:
@@ -194,8 +225,7 @@ def load_all_data() -> pd.DataFrame:
             ]).strip()
             rows.append(rec)
 
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
 # -----------------------------------------------------------------------------
@@ -307,3 +337,4 @@ if q:
 
 else:
     st.info("検索語を入力してください。例：**発表練習**, **グループ活動**, **朗読**, **工作**, **表現力** など")
+
