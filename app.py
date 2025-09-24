@@ -70,6 +70,65 @@ def load_all_data_no_cache():
             rows.append(rec)
     return pd.DataFrame(rows)
 
+# =========================
+#  ラベル形式のシートを1レコードに整形
+# =========================
+LABELS = [
+    "校舎名","コンテンツ名","テーマ","対象生徒","対象","参加人数",
+    "準備物","実施方法","子供たちの反応","子どもたちの反応","良かった点","改善点"
+]
+
+def _normalize(s):
+    import unicodedata, re
+    if not isinstance(s, str): s = "" if s is None else str(s)
+    s = unicodedata.normalize("NFKC", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def extract_value(values, label):
+    """行ラベル（左:ラベル, 右:値）を想定。見つかったら右側セルを連結して返す。"""
+    lab = _normalize(label)
+    for row in values:
+        for j, cell in enumerate(row):
+            if lab and lab in _normalize(cell):
+                right = row[j+1:] if j+1 < len(row) else []
+                toks = [c for c in right if str(c).strip()]
+                if toks:
+                    return " ".join(toks).strip()
+    return ""
+
+def parse_sheet(values):
+    """スプレッドシート1枚→辞書。ラベルが無い場合は全セルを結合して最低限返す。"""
+    rec = {}
+    for lab in LABELS:
+        rec[lab] = extract_value(values, lab)
+
+    # 子ども/子供 を統一
+    if not rec.get("子供たちの反応"):
+        rec["子供たちの反応"] = rec.get("子どもたちの反応", "")
+
+    # 表示用キーへマッピング
+    out = {
+        "校舎名": rec.get("校舎名",""),
+        "コンテンツ名": rec.get("コンテンツ名",""),
+        "テーマ": rec.get("テーマ",""),
+        "対象": rec.get("対象生徒","") or rec.get("対象",""),
+        "参加人数": rec.get("参加人数",""),
+        "準備物": rec.get("準備物",""),
+        "実施方法": rec.get("実施方法",""),
+        "子供たちの反応": rec.get("子供たちの反応",""),
+        "良かった点": rec.get("良かった点",""),
+        "改善点": rec.get("改善点",""),
+    }
+
+    # もし主要フィールドが全部空なら、全セルを繋いで最低限の検索テキストを作る
+    if not any(out.values()):
+        flat = " ".join([" ".join([str(c) for c in r if str(c).strip()]) for r in values])
+        out["コンテンツ名"] = out["コンテンツ名"] or "(名称未設定)"
+        out["テーマ"] = flat[:200]
+
+    return out
+
 # 実行（まずはデバッグログを出すことが目的）
 df = load_all_data_no_cache()
 st.write(f"📄 読み込めたレコード数: {len(df)}")
@@ -298,6 +357,7 @@ for i, total, s_sem, s_bm in results:
 
 if shown == 0:
     st.info("該当がフィルタで除外されました。フィルタや件数を調整してください。")
+
 
 
 
