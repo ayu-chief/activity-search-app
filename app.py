@@ -6,7 +6,28 @@ from sentence_transformers import SentenceTransformer, util
 from rank_bm25 import BM25Okapi
 import re, unicodedata
 
-# gspread認証のすぐ下あたりに追加
+st.set_page_config(page_title="🎯 活動コンテンツ検索", layout="wide")
+
+# =========================
+#  Google Sheets 接続設定
+# =========================
+SERVICE_ACCOUNT_INFO = st.secrets["google_service_account"]
+SPREADSHEET_IDS = [
+    "1GCenO3IlDFrSITj1r90G_Vz_11D66POc8ny9HMtdCcM",
+    "1Rjkgc6whTpg4FKUNLVSdzFSya-_tg42Wg4e10p-MmmI",
+    "1PFDBuFuqxC4OWMCPjErP8uYYRovE55t-0oWsXNMCMqc",
+    "1p4utUR9of_uSQNpzwJpSXgKiPrNur5nSTgHZvrbwmuc",
+    "1HULvSdUAdSNdXXhPshu4mfwraf-bNq6zakFRhKF4Yfg",
+]
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
+gc = gspread.authorize(creds)
+
+# ← ここで表示（この位置なら NameError になりません）
 st.info(f"Service Account: {creds.service_account_email}")
 
 @st.cache_data(show_spinner=False)
@@ -18,11 +39,9 @@ def load_all_data():
             sh = gc.open_by_key(sid)
             st.success(f"✅ Opened: {sh.title}")
         except Exception as e:
-            # 失敗しても続行（原因を表示）
             import traceback
             st.error(f"❌ Failed to open: {sid}")
             st.code("".join(traceback.format_exception_only(type(e), e)))
-            # continue で他のIDは読み込む
             continue
 
         for ws in sh.worksheets():
@@ -35,7 +54,7 @@ def load_all_data():
 
             if not vals:
                 continue
-            rec = parse_sheet(vals)
+            rec = parse_sheet(vals)  # ← 既存の関数をそのまま使用
             if not any(rec.values()):
                 continue
 
@@ -50,8 +69,6 @@ def load_all_data():
             rows.append(rec)
 
     return pd.DataFrame(rows)
-
-st.set_page_config(page_title="🎯 活動コンテンツ検索", layout="wide")
 
 # =========================
 #  Google Sheets 接続設定
@@ -296,4 +313,5 @@ for i, total, s_sem, s_bm in results:
 
 if shown == 0:
     st.info("該当がフィルタで除外されました。フィルタや件数を調整してください。")
+
 
