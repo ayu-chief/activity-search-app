@@ -6,6 +6,51 @@ from sentence_transformers import SentenceTransformer, util
 from rank_bm25 import BM25Okapi
 import re, unicodedata
 
+# gspread認証のすぐ下あたりに追加
+st.info(f"Service Account: {creds.service_account_email}")
+
+@st.cache_data(show_spinner=False)
+def load_all_data():
+    rows = []
+    for sid in SPREADSHEET_IDS:
+        try:
+            st.write(f"🔎 Trying to open: {sid}")
+            sh = gc.open_by_key(sid)
+            st.success(f"✅ Opened: {sh.title}")
+        except Exception as e:
+            # 失敗しても続行（原因を表示）
+            import traceback
+            st.error(f"❌ Failed to open: {sid}")
+            st.code("".join(traceback.format_exception_only(type(e), e)))
+            # continue で他のIDは読み込む
+            continue
+
+        for ws in sh.worksheets():
+            try:
+                vals = ws.get_all_values()
+            except Exception as e:
+                st.error(f"❌ Failed to read values: {sh.title} / {ws.title}")
+                st.code(str(e))
+                continue
+
+            if not vals:
+                continue
+            rec = parse_sheet(vals)
+            if not any(rec.values()):
+                continue
+
+            rec["スプレッドシート"] = sh.title
+            rec["ファイルID"] = sid
+            rec["シート名"] = ws.title
+            rec["検索用テキスト"] = " ".join([
+                rec.get("コンテンツ名",""), rec.get("テーマ",""), rec.get("対象",""),
+                rec.get("準備物",""), rec.get("実施方法",""),
+                rec.get("子供たちの反応",""), rec.get("良かった点",""), rec.get("改善点","")
+            ]).strip()
+            rows.append(rec)
+
+    return pd.DataFrame(rows)
+
 st.set_page_config(page_title="🎯 活動コンテンツ検索", layout="wide")
 
 # =========================
@@ -251,3 +296,4 @@ for i, total, s_sem, s_bm in results:
 
 if shown == 0:
     st.info("該当がフィルタで除外されました。フィルタや件数を調整してください。")
+
