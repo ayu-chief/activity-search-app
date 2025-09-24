@@ -13,6 +13,7 @@ from google.oauth2.service_account import Credentials
 # 検索系
 from sentence_transformers import SentenceTransformer, util
 from rank_bm25 import BM25Okapi
+import numpy as np
 
 # -----------------------------------------------------------------------------
 # 基本設定
@@ -38,10 +39,9 @@ creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPE
 gc = gspread.authorize(creds)
 st.info(f"Service Account: {creds.service_account_email}")
 
-# レート制限対策用
+# レート制限対策（広め）
 BASE_WAIT = 5.0   # スプレッドシート間の待機（秒）
 MAX_RETRY = 6     # 429時の最大リトライ回数
-
 
 # -----------------------------------------------------------------------------
 # 正規化ヘルパ
@@ -52,7 +52,6 @@ def normalize(s: str) -> str:
     s = unicodedata.normalize("NFKC", str(s))
     s = re.sub(r"\s+", " ", s).strip()
     return s
-
 
 # -----------------------------------------------------------------------------
 # シート1枚 → レコード化（ラベル取り出し）
@@ -77,11 +76,8 @@ def parse_sheet(values: List[List[str]]) -> Dict[str, str]:
     rec = {}
     for lab in LABELS:
         rec[lab] = extract_value(values, lab)
-
-    # 子ども/子供 を統一
     if not rec.get("子供たちの反応"):
         rec["子供たちの反応"] = rec.get("子どもたちの反応", "")
-
     out = {
         "校舎名": rec.get("校舎名", ""),
         "コンテンツ名": rec.get("コンテンツ名", ""),
@@ -94,21 +90,16 @@ def parse_sheet(values: List[List[str]]) -> Dict[str, str]:
         "良かった点": rec.get("良かった点", ""),
         "改善点": rec.get("改善点", ""),
     }
-
-    # 主要フィールドが空なら保険として全セル連結
     if not any(out.values()):
         flat = " ".join([" ".join([str(c) for c in r if str(c).strip()]) for r in values])
         out["コンテンツ名"] = out["コンテンツ名"] or "(名称未設定)"
         out["テーマ"] = flat[:200]
-
     return out
 
-
 # -----------------------------------------------------------------------------
-# 429を避ける：スプレッドシート単位で batchGet するローダ
+# 429回避：worksheets()を使わず、metadata(title)→values.batchGet
 # -----------------------------------------------------------------------------
 def open_sheet_by_id(sid: str):
-    """スプレッドシートを開く（429は指数バックオフで再試行）"""
     for attempt in range(MAX_RETRY):
         try:
             sh = gc.open_by_key(sid)
@@ -130,23 +121,17 @@ def open_sheet_by_id(sid: str):
             return None
 
 @st.cache_data(show_spinner=True, ttl=6*60*60)
-def load_all_data() -> pd.DataFrame:
-    """
-    - worksheets() を使わず、メタデータを fields 指定で軽量取得
-    - そのタイトルから ranges を作り、values.batchGet で一括取得
-    - すべてのAPI呼び出しに指数バックオフ付き
-    """
+def load_all_data(_version:int=2) -> pd.DataFrame:
     rows = []
     for sid in SPREADSHEET_IDS:
         sh = open_sheet_by_id(sid)
         if not sh:
             continue
 
-        # ---- 1) シート一覧（タイトル）を軽量に取得
+        # 1) 軽量メタデータ取得（タイトルだけ）
         meta = None
         for attempt in range(MAX_RETRY):
             try:
-                # タイトルだけ取得（fields を絞るのがポイント）
                 meta = sh.fetch_sheet_metadata(params={"fields": "sheets(properties(title))"})
                 break
             except APIError as e:
@@ -169,20 +154,16 @@ def load_all_data() -> pd.DataFrame:
         if not meta:
             continue
 
-        sheet_titles = [s["properties"]["title"] for s in meta.get("sheets", []) if "properties" in s]
+        titles = [s["properties"]["title"] for s in meta.get("sheets", []) if "properties" in s]
+        # 使う列幅を必要最小限に（A:Q など必要に応じて調整）
+        ranges = [f"'{t}'!A:Q" for t in titles]
 
-        # 読みたい列幅を狭める（必要に合わせて変更。A:Q 推奨）
-        ranges = [f"'{title}'!A:Q" for title in sheet_titles]
-
-        # ---- 2) データ一括取得（values.batchGet）
+        # 2) 一括取得（values.batchGet）
         time.sleep(BASE_WAIT)
         vals_resp = None
         for attempt in range(MAX_RETRY):
             try:
-                vals_resp = sh.values_batch_get(
-                    ranges=ranges,
-                    params={"majorDimension": "ROWS"}
-                )
+                vals_resp = sh.values_batch_get(ranges=ranges, params={"majorDimension": "ROWS"})
                 break
             except APIError as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
@@ -227,13 +208,11 @@ def load_all_data() -> pd.DataFrame:
 
     return pd.DataFrame(rows)
 
-
 # -----------------------------------------------------------------------------
 # 検索準備（埋め込み＋BM25）
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=True)
 def load_embedder():
-    # 小型・多言語
     return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
 @st.cache_data(show_spinner=False)
@@ -241,7 +220,6 @@ def build_bm25(corpus_tokens: List[List[str]]):
     return BM25Okapi(corpus_tokens)
 
 def tokenize_ja(text: str) -> List[str]:
-    # シンプルな空白・句読点分割（形態素解析なしでもそこそこ動く）
     text = normalize(text)
     toks = re.split(r"[ \u3000、。・,./!?！？\-\n\r\t]+", text)
     return [t for t in toks if t]
@@ -253,7 +231,6 @@ SYNONYMS = {
     "創作": ["ものづくり", "制作", "工作", "クリエイティブ"],
     "読解": ["読み取り", "感想", "読書", "朗読"],
 }
-
 
 # -----------------------------------------------------------------------------
 # UI
@@ -268,10 +245,9 @@ with st.sidebar:
 
 # データ読み込み
 with st.spinner("シートを読み込んでいます…"):
-    df = load_all_data()
+    df = load_all_data(_version=2)
 
 st.write(f"📄 読み込めたレコード数: {len(df)}")
-
 if len(df) == 0:
     st.stop()
 
@@ -301,7 +277,6 @@ if q:
     sem_scores = util.cos_sim(q_emb, corpus_emb).cpu().numpy()[0]
 
     # 正規化（0-1）
-    import numpy as np
     def minmax(x):
         x = np.array(x, dtype=float)
         if x.max() - x.min() < 1e-9:
@@ -334,7 +309,5 @@ if q:
                 st.write("**良かった点**:", row.get("良かった点",""))
                 st.write("**改善点**:", row.get("改善点",""))
             st.caption(f"score={final[i]:.3f} / semantic={sem_n[i]:.3f} / bm25={bm25_n[i]:.3f}")
-
 else:
     st.info("検索語を入力してください。例：**発表練習**, **グループ活動**, **朗読**, **工作**, **表現力** など")
-
