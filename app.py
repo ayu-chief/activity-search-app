@@ -36,7 +36,6 @@ SCOPES = [
 ]
 creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
 gc = gspread.authorize(creds)
-st.info(f"Service Account: {creds.service_account_email}")
 
 # レート制限対策（広め推奨）
 BASE_WAIT = 8.0   # スプレッドシート間の待機（秒）
@@ -309,3 +308,4 @@ if q:
             st.caption(f"score={final[i]:.3f} / semantic={sem_n[i]:.3f} / bm25={bm25_n[i]:.3f}")
 else:
     st.info("検索語を入力してください。例：**発表練習**, **グループ活動**, **朗読**, **工作**, **表現力** など")
+
