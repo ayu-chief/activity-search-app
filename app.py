@@ -9,9 +9,7 @@ import re, unicodedata
 
 st.set_page_config(page_title="🎯 活動コンテンツ検索", layout="wide")
 
-# =========================
-#  Google Sheets 接続設定（統一）
-# =========================
+# ============ Google Sheets 接続 ============
 SERVICE_ACCOUNT_INFO = st.secrets["google_service_account"]
 SPREADSHEET_IDS = [
     "1GCenO3IlDFrSITj1r90G_Vz_11D66POc8ny9HMtdCcM",
@@ -20,37 +18,35 @@ SPREADSHEET_IDS = [
     "1p4utUR9of_uSQNpzwJpSXgKiPrNur5nSTgHZvrbwmuc",
     "1HULvSdUAdSNdXXhPshu4mfwraf-bNq6zakFRhKF4Yfg",
 ]
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
 creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
 gc = gspread.authorize(creds)
-
-# 認証メールを表示（確認用）
 st.info(f"Service Account: {creds.service_account_email}")
 
-@st.cache_data(show_spinner=False)
-def load_all_data():
+# ============ デバッグ用：1つずつ開いてみる ============
+def open_sheet_by_id(sid: str):
+    try:
+        sh = gc.open_by_key(sid)
+        st.success(f"✅ Opened: {sh.title} ({sid})")
+        return sh
+    except APIError as e:
+        resp = getattr(e, "response", None)
+        code = getattr(resp, "status_code", "?")
+        text = getattr(resp, "text", str(e))
+        st.error(f"❌ Failed to open (status={code}): {sid}")
+        st.code(text[:2000])
+        return None
+    except Exception as e:
+        st.error(f"❌ Failed to open (unexpected): {sid}")
+        st.code(str(e))
+        return None
+
+def load_all_data_no_cache():
     rows = []
     for sid in SPREADSHEET_IDS:
-        try:
-            st.write(f"🔎 Trying to open: {sid}")
-            sh = gc.open_by_key(sid)
-            st.success(f"✅ Opened: {sh.title}")
-        except APIError as e:
-            # gspreadのHTTPレスポンスを表示（403/404 の切り分けに有用）
-            resp = getattr(e, "response", None)
-            code = getattr(resp, "status_code", "?")
-            text = getattr(resp, "text", str(e))
-            st.error(f"❌ Failed to open (status={code}): {sid}")
-            st.code(text[:2000])
-            continue
-        except Exception as e:
-            st.error(f"❌ Failed to open (unexpected): {sid}")
-            st.code(str(e))
-            continue
-
+        sh = open_sheet_by_id(sid)
+        if not sh:
+            continue  # 失敗したIDは飛ばして次へ
         for ws in sh.worksheets():
             try:
                 vals = ws.get_all_values()
@@ -58,13 +54,11 @@ def load_all_data():
                 st.error(f"❌ Failed to read values: {sh.title} / {ws.title}")
                 st.code(str(e))
                 continue
-
             if not vals:
                 continue
-            rec = parse_sheet(vals)  # 既存の関数を利用
+            rec = parse_sheet(vals)  # ← 既存のパーサーを利用
             if not any(rec.values()):
                 continue
-
             rec["スプレッドシート"] = sh.title
             rec["ファイルID"] = sid
             rec["シート名"] = ws.title
@@ -74,8 +68,11 @@ def load_all_data():
                 rec.get("子供たちの反応",""), rec.get("良かった点",""), rec.get("改善点","")
             ]).strip()
             rows.append(rec)
-
     return pd.DataFrame(rows)
+
+# 実行（まずはデバッグログを出すことが目的）
+df = load_all_data_no_cache()
+st.write(f"📄 読み込めたレコード数: {len(df)}")
 
 # =========================
 #  テキスト正規化/トークン化
@@ -301,6 +298,7 @@ for i, total, s_sem, s_bm in results:
 
 if shown == 0:
     st.info("該当がフィルタで除外されました。フィルタや件数を調整してください。")
+
 
 
 
