@@ -105,7 +105,7 @@ def parse_sheet(values: List[List[str]]) -> Dict[str, str]:
     return out
 
 # -----------------------------------------------------------------------------
-# 429回避：worksheets() を使わず、metadata(title)→values.batchGet
+# 429回避：worksheets() を使わず、metadata(title,sheetId) → values.batchGet
 # -----------------------------------------------------------------------------
 def _short_id(sid: str) -> str:
     return f"{sid[:6]}…{sid[-4:]}" if len(sid) > 12 else sid
@@ -132,18 +132,20 @@ def open_sheet_by_id(sid: str):
 
 @st.cache_data(show_spinner=True, ttl=6*60*60)
 def load_all_data_v2() -> pd.DataFrame:
-    """worksheets()は使わず、タイトルだけ取得→values.batchGetで一括取得"""
+    """worksheets()は使わず、タイトル＆sheetIdを取得→values.batchGetで一括取得"""
     rows = []
     for sid in SPREADSHEET_IDS:
         sh = open_sheet_by_id(sid)
         if not sh:
             continue
 
-        # 1) タイトルのみ軽量取得
+        # 1) タイトルと sheetId (gid) を軽量取得
         meta = None
         for attempt in range(MAX_RETRY):
             try:
-                meta = sh.fetch_sheet_metadata(params={"fields": "sheets(properties(title))"})
+                meta = sh.fetch_sheet_metadata(
+                    params={"fields": "sheets(properties(title,sheetId))"}
+                )
                 break
             except APIError as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
@@ -160,7 +162,10 @@ def load_all_data_v2() -> pd.DataFrame:
         if not meta:
             continue
 
-        titles = [s["properties"]["title"] for s in meta.get("sheets", []) if "properties" in s]
+        sheets_props = [s["properties"] for s in meta.get("sheets", []) if "properties" in s]
+        title_to_gid = {p.get("title"): p.get("sheetId") for p in sheets_props}
+
+        titles = [p.get("title") for p in sheets_props]
         # 列幅は必要に応じて狭める（A:N など）。狭いほど速い
         ranges = [f"'{t}'!A:Q" for t in titles]
 
@@ -200,6 +205,7 @@ def load_all_data_v2() -> pd.DataFrame:
             rec["スプレッドシート"] = sh.title
             rec["ファイルID"] = sid
             rec["シート名"] = ws_title
+            rec["シートGID"] = title_to_gid.get(ws_title)  # ★ 追加
             rec["検索用テキスト"] = " ".join([
                 rec.get("コンテンツ名",""), rec.get("テーマ",""), rec.get("対象",""),
                 rec.get("準備物",""), rec.get("実施方法",""),
@@ -311,7 +317,15 @@ if q:
     st.subheader("検索結果")
     for rank, i in enumerate(idx, start=1):
         row = df.iloc[i]
-        url = f"https://docs.google.com/spreadsheets/d/{row['ファイルID']}/edit"
+
+        # ★ gid があれば特定タブへ直リンク
+        gid = row.get("シートGID")
+        fid = row["ファイルID"]
+        if pd.notna(gid):
+            url = f"https://docs.google.com/spreadsheets/d/{fid}/edit#gid={int(gid)}"
+        else:
+            url = f"https://docs.google.com/spreadsheets/d/{fid}/edit"
+
         with st.container(border=True):
             st.markdown(
                 f"**{rank}. {row.get('コンテンツ名','(名称未設定)')}** 　"
@@ -330,4 +344,3 @@ if q:
                 st.write("**良かった点**:", row.get("良かった点",""))
                 st.write("**改善点**:", row.get("改善点",""))
             st.caption(f"score={final[i]:.3f} / semantic={sem_n[i]:.3f} / bm25={bm25_n[i]:.3f}")
-
