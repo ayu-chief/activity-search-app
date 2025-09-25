@@ -276,7 +276,6 @@ embedder = load_embedder()
 corpus_emb = embedder.encode(corpus_texts, normalize_embeddings=True, show_progress_bar=False)
 
 # 検索フォーム
-st.divider()
 st.caption("🔎 キーワードを入力して検索")
 q = st.text_input(
     label="キーワードを入力",
@@ -331,3 +330,4 @@ if q:
                 st.write("**良かった点**:", row.get("良かった点",""))
                 st.write("**改善点**:", row.get("改善点",""))
             st.caption(f"score={final[i]:.3f} / semantic={sem_n[i]:.3f} / bm25={bm25_n[i]:.3f}")
+
