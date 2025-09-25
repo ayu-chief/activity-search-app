@@ -252,15 +252,12 @@ with st.spinner("シートを読み込んでいます…"):
 if st.session_state.OPENED_LOG:
     short_list = [(title, _short_id(sid)) for (title, sid) in st.session_state.OPENED_LOG]
     with st.expander(f"データソース（{len(short_list)}件）", expanded=False):
-        for title, sid_short in short_list:
-            if not title.startswith("❌"):
-                st.caption(f"✅ {title} ({sid_short})")
-            else:
-                st.caption(title)
-
-st.write(f"📄 読み込めたレコード数: {len(df)}")
-if len(df) == 0:
-    st.stop()
+    st.caption(f"📄 読み込めたレコード数: {len(df)}")
+    for title, sid_short in short_list:
+        if not title.startswith("❌"):
+            st.caption(f"✅ {title} ({sid_short})")
+        else:
+            st.caption(title)
 
 # 検索コーパス
 corpus_texts = (df["検索用テキスト"].fillna("") + " " + df["コンテンツ名"].fillna("")).tolist()
@@ -271,7 +268,7 @@ corpus_emb = embedder.encode(corpus_texts, normalize_embeddings=True, show_progr
 
 # 検索フォーム
 st.divider()
-st.caption("🔎 ここにキーワードを入力して検索")
+st.caption("🔎 キーワードを入力して検索")
 q = st.text_input(
     label="キーワードを入力",
     value="",
@@ -321,4 +318,5 @@ if q:
                 st.write("**良かった点**:", row.get("良かった点",""))
                 st.write("**改善点**:", row.get("改善点",""))
             st.caption(f"score={final[i]:.3f} / semantic={sem_n[i]:.3f} / bm25={bm25_n[i]:.3f}")
+
 
