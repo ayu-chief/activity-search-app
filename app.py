@@ -17,7 +17,7 @@ import numpy as np
 # -----------------------------------------------------------------------------
 # 基本設定
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="🔎活動コンテンツ検索", layout="wide")
+st.set_page_config(page_title="活動コンテンツ検索", layout="wide")
 
 # 読み込み結果の控えめ表示用ログ（Expanderにまとめる）
 if "OPENED_LOG" not in st.session_state:
@@ -236,7 +236,7 @@ SYNONYMS = {
 # -----------------------------------------------------------------------------
 # UI
 # -----------------------------------------------------------------------------
-st.title("🎯 活動コンテンツ検索")
+st.title("活動コンテンツ検索")
 
 with st.sidebar:
     st.header("検索設定")
@@ -270,6 +270,8 @@ embedder = load_embedder()
 corpus_emb = embedder.encode(corpus_texts, normalize_embeddings=True, show_progress_bar=False)
 
 # 検索フォーム
+st.divider()
+st.caption("🔎 ここにキーワードを入力して検索")
 q = st.text_input(
     label="キーワードを入力",
     value="",
@@ -319,3 +321,4 @@ if q:
                 st.write("**良かった点**:", row.get("良かった点",""))
                 st.write("**改善点**:", row.get("改善点",""))
             st.caption(f"score={final[i]:.3f} / semantic={sem_n[i]:.3f} / bm25={bm25_n[i]:.3f}")
+
