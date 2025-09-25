@@ -299,11 +299,11 @@ if mode == "📑 シート別一覧":
         st.info("該当データがありません。")
         st.stop()
 
-    # スプレッドシートごとにまとめて表示（ダウンロードは削除）
+    # スプレッドシートごとにまとめて表示
     for (ss_name, file_id), chunk in grp.groupby(["スプレッドシート", "ファイルID"]):
         with st.expander(f"{ss_name}（{len(chunk)}シート）", expanded=False):
 
-            # 各シート行（件数の「…1件」表示は削除）
+            # 各シートの行
             for _, r in chunk.iterrows():
                 gid = r["シートGID"]
                 if pd.notna(gid):
@@ -311,17 +311,27 @@ if mode == "📑 シート別一覧":
                 else:
                     url = f"https://docs.google.com/spreadsheets/d/{file_id}/edit"
 
-                # タイトルのプレビュー（上位10件）
-                titles = (
+                # ▼ プレビューは「テーマ」を重複除去して上位表示
+                themes_series = (
                     df[(df["スプレッドシート"] == ss_name) & (df["シート名"] == r["シート名"])]
-                    ["コンテンツ名"].fillna("(名称未設定)").unique()[:10]
+                    ["テーマ"]
+                    .fillna("")
+                    .map(normalize)
                 )
-                preview = "、".join(map(str, titles))
+                # 空を除外して重複排除
+                themes_uniq = []
+                seen = set()
+                for t in themes_series:
+                    if t and t not in seen:
+                        seen.add(t)
+                        themes_uniq.append(t)
+                    if len(themes_uniq) >= 3:   # 表示数は必要に応じて調整
+                        break
 
-                # 行の表示（リンクのみ）
+                # 行の表示（リンク＋テーマのプレビュー）
                 st.markdown(f"- [{r['シート名']}]({url})")
-                if preview:
-                    st.caption(preview)
+                if themes_uniq:
+                    st.caption(" ／ ".join(themes_uniq))
 
     st.stop()  # 一覧モードではここで終了
 
@@ -440,4 +450,5 @@ if q:
         if c2.button("全件表示"):
             st.session_state.show_n = len(idx_all)
             st.rerun()
+
 
