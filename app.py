@@ -19,10 +19,14 @@ import numpy as np
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="🎯 活動コンテンツ検索", layout="wide")
 
+# 読み込み結果の控えめ表示用ログ（Expanderにまとめる）
+if "OPENED_LOG" not in st.session_state:
+    st.session_state.OPENED_LOG = []  # [(title, sid), ...]
+
 # -----------------------------------------------------------------------------
 # Google Sheets 接続
 # -----------------------------------------------------------------------------
-SERVICE_ACCOUNT_INFO = st.secrets["google_service_account"]  # Secretsに入れたJSON
+SERVICE_ACCOUNT_INFO = st.secrets["google_service_account"]  # Secretsに保存したJSON
 SPREADSHEET_IDS = [
     "1GCenO3IlDFrSITj1r90G_Vz_11D66POc8ny9HMtdCcM",
     "1Rjkgc6whTpg4FKUNLVSdzFSya-_tg42Wg4e10p-MmmI",
@@ -103,11 +107,15 @@ def parse_sheet(values: List[List[str]]) -> Dict[str, str]:
 # -----------------------------------------------------------------------------
 # 429回避：worksheets() を使わず、metadata(title)→values.batchGet
 # -----------------------------------------------------------------------------
+def _short_id(sid: str) -> str:
+    return f"{sid[:6]}…{sid[-4:]}" if len(sid) > 12 else sid
+
 def open_sheet_by_id(sid: str):
+    """開けたらログに追加（画面にはその場で出さない）"""
     for attempt in range(MAX_RETRY):
         try:
             sh = gc.open_by_key(sid)
-            st.success(f"✅ Opened: {sh.title} ({sid})")
+            st.session_state.OPENED_LOG.append((sh.title, sid))
             return sh
         except APIError as e:
             code = getattr(getattr(e, "response", None), "status_code", None)
@@ -116,12 +124,10 @@ def open_sheet_by_id(sid: str):
                 st.warning(f"⏳ Rate limit: open_by_key (retry {attempt+1}/{MAX_RETRY}) in {wait:.1f}s")
                 time.sleep(wait)
                 continue
-            st.error(f"❌ Failed to open (status={code}): {sid}")
-            st.code(getattr(getattr(e, "response", None), "text", str(e))[:2000])
+            st.session_state.OPENED_LOG.append((f"❌ FAILED: {sid}", sid))
             return None
-        except Exception as e:
-            st.error(f"❌ Failed to open (unexpected): {sid}")
-            st.code(str(e))
+        except Exception:
+            st.session_state.OPENED_LOG.append((f"❌ FAILED: {sid}", sid))
             return None
 
 @st.cache_data(show_spinner=True, ttl=6*60*60)
@@ -146,20 +152,16 @@ def load_all_data_v2() -> pd.DataFrame:
                     st.warning(f"⏳ Rate limit: fetch_sheet_metadata (retry {attempt+1}/{MAX_RETRY}) in {wait:.1f}s")
                     time.sleep(wait)
                     continue
-                st.error(f"❌ Failed to fetch metadata (status={code}): {sh.title}")
-                st.code(getattr(getattr(e, "response", None), "text", str(e))[:2000])
                 meta = None
                 break
-            except Exception as e:
-                st.error(f"❌ Failed to fetch metadata (unexpected): {sh.title}")
-                st.code(str(e))
+            except Exception:
                 meta = None
                 break
         if not meta:
             continue
 
         titles = [s["properties"]["title"] for s in meta.get("sheets", []) if "properties" in s]
-        # 読み取り列幅（必要なら狭める：A:N など）
+        # 列幅は必要に応じて狭める（A:N など）。狭いほど速い
         ranges = [f"'{t}'!A:Q" for t in titles]
 
         # 2) 一括取得（values.batchGet）
@@ -176,13 +178,9 @@ def load_all_data_v2() -> pd.DataFrame:
                     st.warning(f"⏳ Rate limit: values.batchGet (retry {attempt+1}/{MAX_RETRY}) in {wait:.1f}s")
                     time.sleep(wait)
                     continue
-                st.error(f"❌ Failed batchGet (status={code}): {sh.title}")
-                st.code(getattr(getattr(e, "response", None), "text", str(e))[:2000])
                 vals_resp = None
                 break
-            except Exception as e:
-                st.error(f"❌ Failed batchGet (unexpected): {sh.title}")
-                st.code(str(e))
+            except Exception:
                 vals_resp = None
                 break
         if not vals_resp:
@@ -246,9 +244,19 @@ with st.sidebar:
     top_k = st.slider("件数", 5, 50, 15)
     st.caption("※初回は読み込みに時間がかかります（キャッシュ後は速くなります）")
 
-# データ読み込み（v2を必ず呼ぶ）
+# データ読み込み
 with st.spinner("シートを読み込んでいます…"):
     df = load_all_data_v2()
+
+# 読み込み結果の控えめ表示（Expander）
+if st.session_state.OPENED_LOG:
+    short_list = [(title, _short_id(sid)) for (title, sid) in st.session_state.OPENED_LOG]
+    with st.expander(f"データソース（{len(short_list)}件）", expanded=False):
+        for title, sid_short in short_list:
+            if not title.startswith("❌"):
+                st.caption(f"✅ {title} ({sid_short})")
+            else:
+                st.caption(title)
 
 st.write(f"📄 読み込めたレコード数: {len(df)}")
 if len(df) == 0:
@@ -308,4 +316,3 @@ if q:
             st.caption(f"score={final[i]:.3f} / semantic={sem_n[i]:.3f} / bm25={bm25_n[i]:.3f}")
 else:
     st.info("検索語を入力してください。例：**発表練習**, **グループ活動**, **朗読**, **工作**, **表現力** など")
-
