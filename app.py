@@ -248,16 +248,25 @@ with st.sidebar:
 with st.spinner("シートを読み込んでいます…"):
     df = load_all_data_v2()
 
-# 読み込み結果の控えめ表示（Expander）
-if st.session_state.OPENED_LOG:
-    short_list = [(title, _short_id(sid)) for (title, sid) in st.session_state.OPENED_LOG]
-    with st.expander(f"データソース（{len(short_list)}件）", expanded=False):
-        st.caption(f"📄 読み込めたレコード数: {len(df)}")
-        for title, sid_short in short_list:
-            if not title.startswith("❌"):
-                st.caption(f"✅ {title} ({sid_short})")
-            else:
-                st.caption(title)
+# --- データソース表示：ログが無くても df から復元して必ず出す ---
+sources = st.session_state.get("OPENED_LOG", [])
+if (not sources) and (len(df) > 0):
+    tmp = (
+        df[["スプレッドシート", "ファイルID"]]
+        .dropna()
+        .drop_duplicates()
+        .values
+        .tolist()
+    )
+    sources = [(title, sid) for title, sid in tmp]
+
+with st.expander(f"データソース（{len(sources)}件）", expanded=False):
+    st.caption(f"📄 読み込めたレコード数: {len(df)}")
+    for title, sid in sources:
+        if isinstance(title, str) and title.startswith("❌"):
+            st.caption(title)
+        else:
+            st.caption(f"✅ {title} ({_short_id(sid)})")
 
 # 検索コーパス
 corpus_texts = (df["検索用テキスト"].fillna("") + " " + df["コンテンツ名"].fillna("")).tolist()
@@ -275,6 +284,7 @@ q = st.text_input(
     placeholder="例: 発表練習, グループ活動, 朗読, 工作, 表現力 など",
     label_visibility="collapsed",
 )
+
 if q:
     expanded = [q]
     for k, vs in SYNONYMS.items():
@@ -304,7 +314,10 @@ if q:
         row = df.iloc[i]
         url = f"https://docs.google.com/spreadsheets/d/{row['ファイルID']}/edit"
         with st.container(border=True):
-            st.markdown(f"**{rank}. {row.get('コンテンツ名','(名称未設定)')}** 　[{row['スプレッドシート']} / {row['シート名']}]({url})")
+            st.markdown(
+                f"**{rank}. {row.get('コンテンツ名','(名称未設定)')}** 　"
+                f"[{row['スプレッドシート']} / {row['シート名']}]({url})"
+            )
             cols = st.columns(3)
             with cols[0]:
                 st.write("**テーマ**:", row.get("テーマ",""))
@@ -318,7 +331,3 @@ if q:
                 st.write("**良かった点**:", row.get("良かった点",""))
                 st.write("**改善点**:", row.get("改善点",""))
             st.caption(f"score={final[i]:.3f} / semantic={sem_n[i]:.3f} / bm25={bm25_n[i]:.3f}")
-
-
-
-
