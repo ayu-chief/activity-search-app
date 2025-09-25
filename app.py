@@ -222,35 +222,19 @@ def load_all_data_v2() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # -----------------------------------------------------------------------------
-# 検索準備（埋め込み＋BM25）
-# -----------------------------------------------------------------------------
-@st.cache_resource(show_spinner=True)
-def load_embedder():
-    return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-
-@st.cache_data(show_spinner=False)
-def build_bm25(corpus_tokens: List[List[str]]):
-    return BM25Okapi(corpus_tokens)
-
-def tokenize_ja(text: str) -> List[str]:
-    text = normalize(text)
-    toks = re.split(r"[ \u3000、。・,./!?！？\-\n\r\t]+", text)
-    return [t for t in toks if t]
-
-SYNONYMS = {
-    "発表": ["プレゼン", "スピーチ", "表現", "発表練習"],
-    "表現": ["発表", "伝える", "アウトプット"],
-    "協力": ["協働", "チーム", "グループ", "共同"],
-    "創作": ["ものづくり", "制作", "工作", "クリエイティブ"],
-    "読解": ["読み取り", "感想", "読書", "朗読"],
-}
-
-# -----------------------------------------------------------------------------
-# UI
+# UI（モード切替）
 # -----------------------------------------------------------------------------
 st.title("活動コンテンツ検索")
 
 with st.sidebar:
+    st.header("表示モード")
+    mode = st.radio(
+        "ページを選択",
+        ["🔍 検索", "📑 シート別一覧"],
+        index=0,
+        help="検索ページと、スプレッドシート/シートごとの一覧を切り替えます。",
+    )
+
     st.header("検索設定")
     alpha = st.slider("意味重視（1.0） ←→ 語一致重視（0.0）", 0.0, 1.0, 0.7, 0.05)
     # top_k は「最大計算件数」（段階表示でここまで出せる）
@@ -281,14 +265,82 @@ with st.expander(f"データソース（{len(sources)}件）", expanded=False):
         else:
             st.caption(f"✅ {title} ({_short_id(sid)})")
 
-# 検索コーパス
-corpus_texts = (df["検索用テキスト"].fillna("") + " " + df["コンテンツ名"].fillna("")).tolist()
-corpus_tokens = [tokenize_ja(t) for t in corpus_texts]
-bm25 = build_bm25(corpus_tokens)
-embedder = load_embedder()
-corpus_emb = embedder.encode(corpus_texts, normalize_embeddings=True, show_progress_bar=False)
+# =============================================================================
+# 📑 シート別一覧（一覧モード）
+# =============================================================================
+if mode == "📑 シート別一覧":
+    st.subheader("シート別一覧")
 
-# 検索フォーム
+    # スプレッドシートのプルダウン（すべて or 個別）
+    ss_options = (
+        df[["スプレッドシート", "ファイルID"]]
+        .dropna()
+        .drop_duplicates()
+        .sort_values("スプレッドシート")
+        .values
+        .tolist()
+    )
+    ss_names = ["（すべて）"] + [name for name, _id in ss_options]
+    selected_ss = st.selectbox("スプレッドシートを選択", ss_names, index=0)
+
+    if selected_ss == "（すべて）":
+        df_view = df
+    else:
+        df_view = df[df["スプレッドシート"] == selected_ss]
+
+    # シート単位に集計
+    grp = (
+        df_view.groupby(["スプレッドシート", "ファイルID", "シート名", "シートGID"])
+              .size().reset_index(name="レコード数")
+              .sort_values(["スプレッドシート", "シート名"])
+    )
+
+    if grp.empty:
+        st.info("該当データがありません。")
+        st.stop()
+
+    # スプレッドシートごとにまとめて表示
+    for (ss_name, file_id), chunk in grp.groupby(["スプレッドシート", "ファイルID"]):
+        total = int(chunk["レコード数"].sum())
+        with st.expander(f"{ss_name}（{len(chunk)}シート / {total}件）", expanded=False):
+
+            # 一覧CSVダウンロード（このスプレッドシート分）
+            df_dl = chunk[["スプレッドシート","シート名","レコード数"]].rename(
+                columns={"スプレッドシート":"Spreadsheet","シート名":"Sheet","レコード数":"Count"}
+            )
+            st.download_button(
+                "一覧CSVをダウンロード",
+                data=df_dl.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{ss_name}_sheets.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+            # 各シート行
+            for _, r in chunk.iterrows():
+                gid = r["シートGID"]
+                if pd.notna(gid):
+                    url = f"https://docs.google.com/spreadsheets/d/{file_id}/edit#gid={int(gid)}"
+                else:
+                    url = f"https://docs.google.com/spreadsheets/d/{file_id}/edit"
+
+                # タイトルのプレビュー（上位10件）
+                titles = (
+                    df[(df["スプレッドシート"] == ss_name) & (df["シート名"] == r["シート名"])]
+                    ["コンテンツ名"].fillna("(名称未設定)").unique()[:10]
+                )
+                preview = "、".join(map(str, titles))
+
+                # 行の表示
+                st.markdown(f"- [{r['シート名']}]({url}) … **{int(r['レコード数'])}件**")
+                if preview:
+                    st.caption(preview)
+
+    st.stop()  # 一覧モードではここで終了（下の検索処理は実行しない）
+
+# =============================================================================
+# 🔍 検索（検索モード）
+# =============================================================================
 st.caption("🔎 キーワードを入力して検索")
 q = st.text_input(
     label="キーワードを入力",
@@ -303,6 +355,34 @@ if q != st.session_state.last_query:
     st.session_state.last_query = q
 
 if q:
+    # 検索準備（埋め込み＋BM25）※検索モードでのみ計算
+    def tokenize_ja(text: str) -> List[str]:
+        text = normalize(text)
+        toks = re.split(r"[ \u3000、。・,./!?！？\-\n\r\t]+", text)
+        return [t for t in toks if t]
+
+    @st.cache_data(show_spinner=False)
+    def build_bm25(corpus_tokens: List[List[str]]):
+        return BM25Okapi(corpus_tokens)
+
+    @st.cache_resource(show_spinner=True)
+    def load_embedder():
+        return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+
+    corpus_texts = (df["検索用テキスト"].fillna("") + " " + df["コンテンツ名"].fillna("")).tolist()
+    corpus_tokens = [tokenize_ja(t) for t in corpus_texts]
+    bm25 = build_bm25(corpus_tokens)
+    embedder = load_embedder()
+    corpus_emb = embedder.encode(corpus_texts, normalize_embeddings=True, show_progress_bar=False)
+
+    SYNONYMS = {
+        "発表": ["プレゼン", "スピーチ", "表現", "発表練習"],
+        "表現": ["発表", "伝える", "アウトプット"],
+        "協力": ["協働", "チーム", "グループ", "共同"],
+        "創作": ["ものづくり", "制作", "工作", "クリエイティブ"],
+        "読解": ["読み取り", "感想", "読書", "朗読"],
+    }
+
     expanded = [q]
     for k, vs in SYNONYMS.items():
         if k in q:
