@@ -23,6 +23,12 @@ st.set_page_config(page_title="活動コンテンツ検索", layout="wide")
 if "OPENED_LOG" not in st.session_state:
     st.session_state.OPENED_LOG = []  # [(title, sid), ...]
 
+# 一覧の段階表示用（さらに表示）
+if "show_n" not in st.session_state:
+    st.session_state.show_n = 15
+if "last_query" not in st.session_state:
+    st.session_state.last_query = ""
+
 # -----------------------------------------------------------------------------
 # Google Sheets 接続
 # -----------------------------------------------------------------------------
@@ -105,7 +111,7 @@ def parse_sheet(values: List[List[str]]) -> Dict[str, str]:
     return out
 
 # -----------------------------------------------------------------------------
-# 429回避：worksheets() を使わず、metadata(title,sheetId) → values.batchGet
+# 429回避：metadata(title,sheetId) → values.batchGet
 # -----------------------------------------------------------------------------
 def _short_id(sid: str) -> str:
     return f"{sid[:6]}…{sid[-4:]}" if len(sid) > 12 else sid
@@ -205,7 +211,7 @@ def load_all_data_v2() -> pd.DataFrame:
             rec["スプレッドシート"] = sh.title
             rec["ファイルID"] = sid
             rec["シート名"] = ws_title
-            rec["シートGID"] = title_to_gid.get(ws_title)  # ★ 追加
+            rec["シートGID"] = title_to_gid.get(ws_title)
             rec["検索用テキスト"] = " ".join([
                 rec.get("コンテンツ名",""), rec.get("テーマ",""), rec.get("対象",""),
                 rec.get("準備物",""), rec.get("実施方法",""),
@@ -247,7 +253,8 @@ st.title("活動コンテンツ検索")
 with st.sidebar:
     st.header("検索設定")
     alpha = st.slider("意味重視（1.0） ←→ 語一致重視（0.0）", 0.0, 1.0, 0.7, 0.05)
-    top_k = st.slider("件数", 5, 50, 15)
+    # top_k は「最大計算件数」（段階表示でここまで出せる）
+    top_k = st.slider("件数（最大計算件数）", 50, 500, 200, step=50)
     st.caption("※初回は読み込みに時間がかかります（キャッシュ後は速くなります）")
 
 # データ読み込み
@@ -290,6 +297,11 @@ q = st.text_input(
     label_visibility="collapsed",
 )
 
+# 検索語が変わったら表示件数をリセット
+if q != st.session_state.last_query:
+    st.session_state.show_n = 15
+    st.session_state.last_query = q
+
 if q:
     expanded = [q]
     for k, vs in SYNONYMS.items():
@@ -312,13 +324,20 @@ if q:
     bm25_n = minmax(bm25_scores)
     sem_n  = minmax(sem_scores)
     final  = alpha * sem_n + (1 - alpha) * bm25_n
-    idx = np.argsort(final)[::-1][:top_k]
 
-    st.subheader("検索結果")
+    # 上位 top_k まで取得（ここまで段階表示で増やせる）
+    idx_all = np.argsort(final)[::-1][:top_k]
+
+    # いま表示する件数（15件ずつ増える）
+    show_n = min(st.session_state.show_n, len(idx_all))
+    idx = idx_all[:show_n]
+
+    st.subheader(f"検索結果（{len(idx_all)}件中 {show_n}件を表示）")
+
     for rank, i in enumerate(idx, start=1):
         row = df.iloc[i]
 
-        # ★ gid があれば特定タブへ直リンク
+        # gid があれば特定タブへ直リンク
         gid = row.get("シートGID")
         fid = row["ファイルID"]
         if pd.notna(gid):
@@ -344,3 +363,13 @@ if q:
                 st.write("**良かった点**:", row.get("良かった点",""))
                 st.write("**改善点**:", row.get("改善点",""))
             st.caption(f"score={final[i]:.3f} / semantic={sem_n[i]:.3f} / bm25={bm25_n[i]:.3f}")
+
+    # --- さらに表示ボタン ---
+    if show_n < len(idx_all):
+        c1, c2, _ = st.columns([1, 1, 6])
+        if c1.button("さらに表示（+15）"):
+            st.session_state.show_n = min(show_n + 15, len(idx_all))
+            st.rerun()
+        if c2.button("全件表示"):
+            st.session_state.show_n = len(idx_all)
+            st.rerun()
