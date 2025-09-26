@@ -1,5 +1,4 @@
 # app.py
-# -*- coding: utf-8 -*-
 import time
 import re
 import unicodedata
@@ -7,32 +6,33 @@ from typing import List, Dict
 
 import streamlit as st
 import pandas as pd
-import numpy as np
-
 import gspread
 from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 
 from sentence_transformers import SentenceTransformer, util
 from rank_bm25 import BM25Okapi
+import numpy as np
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # 基本設定
-# =============================================================================
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="活動コンテンツ検索", layout="wide")
 
-# 初期化（セッションステート）
+# 読み込み結果の控えめ表示用ログ（Expanderにまとめる）
 if "OPENED_LOG" not in st.session_state:
     st.session_state.OPENED_LOG = []  # [(title, sid), ...]
+
+# 一覧の段階表示用（さらに表示）
 if "show_n" not in st.session_state:
-    st.session_state.show_n = 15      # 検索結果の段階表示
+    st.session_state.show_n = 15
 if "last_query" not in st.session_state:
     st.session_state.last_query = ""
 
-# =============================================================================
-# Google Sheets 接続設定
-# =============================================================================
-SERVICE_ACCOUNT_INFO = st.secrets["google_service_account"]
+# -----------------------------------------------------------------------------
+# Google Sheets 接続
+# -----------------------------------------------------------------------------
+SERVICE_ACCOUNT_INFO = st.secrets["google_service_account"]  # Secretsに保存したJSON
 SPREADSHEET_IDS = [
     "1GCenO3IlDFrSITj1r90G_Vz_11D66POc8ny9HMtdCcM",
     "1Rjkgc6whTpg4FKUNLVSdzFSya-_tg42Wg4e10p-MmmI",
@@ -47,13 +47,13 @@ SCOPES = [
 creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
 gc = gspread.authorize(creds)
 
-# レート制限対策（必要に応じて調整）
-BASE_WAIT = 5.0   # 8.0 → 5.0 に短縮（429 が出るようなら戻してください）
-MAX_RETRY = 6
+# レート制限対策（広め推奨）
+BASE_WAIT = 8.0   # スプレッドシート間の待機（秒）
+MAX_RETRY = 6     # 429時の最大リトライ回数
 
-# =============================================================================
-# ユーティリティ
-# =============================================================================
+# -----------------------------------------------------------------------------
+# 正規化ヘルパ
+# -----------------------------------------------------------------------------
 def normalize(s: str) -> str:
     if s is None:
         return ""
@@ -61,11 +61,8 @@ def normalize(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def _short_id(sid: str) -> str:
-    return f"{sid[:6]}…{sid[-4:]}" if len(sid) > 12 else sid
-
 # -----------------------------------------------------------------------------
-# シート → レコード化
+# シート1枚 → レコード化（ラベル取り出し）
 # -----------------------------------------------------------------------------
 LABELS = [
     "校舎名", "コンテンツ名", "テーマ", "対象生徒", "対象", "参加人数",
@@ -77,7 +74,7 @@ def extract_value(values: List[List[str]], label: str) -> str:
     for row in values:
         for j, cell in enumerate(row):
             if lab and lab in normalize(cell):
-                right = row[j + 1:] if j + 1 < len(row) else []
+                right = row[j+1:] if j+1 < len(row) else []
                 toks = [c for c in right if str(c).strip()]
                 if toks:
                     return " ".join(normalize(c) for c in toks).strip()
@@ -114,8 +111,11 @@ def parse_sheet(values: List[List[str]]) -> Dict[str, str]:
     return out
 
 # -----------------------------------------------------------------------------
-# Google Sheets 読み込み（429 回避：metadata→values.batchGet）
+# 429回避：metadata(title,sheetId) → values.batchGet
 # -----------------------------------------------------------------------------
+def _short_id(sid: str) -> str:
+    return f"{sid[:6]}…{sid[-4:]}" if len(sid) > 12 else sid
+
 def open_sheet_by_id(sid: str):
     """開けたらログに追加（画面にはその場で出さない）"""
     for attempt in range(MAX_RETRY):
@@ -136,7 +136,7 @@ def open_sheet_by_id(sid: str):
             st.session_state.OPENED_LOG.append((f"❌ FAILED: {sid}", sid))
             return None
 
-@st.cache_data(show_spinner=True, ttl=24*3600)  # 24時間キャッシュ
+@st.cache_data(show_spinner=True, ttl=6*60*60)
 def load_all_data_v2() -> pd.DataFrame:
     """worksheets()は使わず、タイトル＆sheetIdを取得→values.batchGetで一括取得"""
     rows = []
@@ -170,10 +170,10 @@ def load_all_data_v2() -> pd.DataFrame:
 
         sheets_props = [s["properties"] for s in meta.get("sheets", []) if "properties" in s]
         title_to_gid = {p.get("title"): p.get("sheetId") for p in sheets_props}
-        titles = [p.get("title") for p in sheets_props]
 
-        # 列幅を必要に応じて調整（狭いほど速い）
-        ranges = [f"'{t}'!A:Q" for t in titles]  # さらに軽くするなら A:N などへ
+        titles = [p.get("title") for p in sheets_props]
+        # 列幅は必要に応じて狭める（A:N など）。狭いほど速い
+        ranges = [f"'{t}'!A:Q" for t in titles]
 
         # 2) 一括取得（values.batchGet）
         time.sleep(BASE_WAIT)
@@ -221,58 +221,31 @@ def load_all_data_v2() -> pd.DataFrame:
 
     return pd.DataFrame(rows)
 
-# =============================================================================
-# 検索準備（埋め込み＋BM25）— 埋め込みは遅延計算＆キャッシュ
-# =============================================================================
-@st.cache_resource(show_spinner=True)
-def load_embedder():
-    return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-
-@st.cache_data(show_spinner=False)
-def build_bm25(corpus_tokens: List[List[str]]):
-    return BM25Okapi(corpus_tokens)
-
-def tokenize_ja(text: str) -> List[str]:
-    text = normalize(text)
-    toks = re.split(r"[ \u3000、。・,./!?！？\-\n\r\t]+", text)
-    return [t for t in toks if t]
-
-@st.cache_data(show_spinner=True, ttl=24*3600)
-def embed_corpus(texts: List[str]):
-    emb = load_embedder()
-    return emb.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-
-SYNONYMS = {
-    "発表": ["プレゼン", "スピーチ", "表現", "発表練習"],
-    "表現": ["発表", "伝える", "アウトプット"],
-    "協力": ["協働", "チーム", "グループ", "共同"],
-    "創作": ["ものづくり", "制作", "工作", "クリエイティブ"],
-    "読解": ["読み取り", "感想", "読書", "朗読"],
-}
-
-# =============================================================================
-# UI
-# =============================================================================
+# -----------------------------------------------------------------------------
+# UI（モード切替）
+# -----------------------------------------------------------------------------
 st.title("活動コンテンツ検索")
 
 with st.sidebar:
-    st.header("表示・検索設定")
-    mode = st.radio("モード", ["🔍 検索", "📑 シート別一覧"], horizontal=False)
+    st.header("表示モード")
+    mode = st.radio(
+        "ページを選択",
+        ["🔍 検索", "📑 シート別一覧"],
+        index=0,
+        help="検索ページと、スプレッドシート/シートごとの一覧を切り替えます。",
+    )
 
-    # 検索用
+    st.header("検索設定")
     alpha = st.slider("意味重視（1.0） ←→ 語一致重視（0.0）", 0.0, 1.0, 0.7, 0.05)
+    # top_k は「最大計算件数」（段階表示でここまで出せる）
     top_k = st.slider("件数（最大計算件数）", 50, 500, 200, step=50)
-
-    # スマホ向けに 1 カラムへ切替
-    is_mobile = st.toggle("モバイル表示（結果1カラム）", value=False)
-
     st.caption("※初回は読み込みに時間がかかります（キャッシュ後は速くなります）")
 
 # データ読み込み
 with st.spinner("シートを読み込んでいます…"):
     df = load_all_data_v2()
 
-# --- データソース（控えめ表示）：ログが無くても df から復元して出す ---
+# --- データソース表示：ログが無くても df から復元して必ず出す ---
 sources = st.session_state.get("OPENED_LOG", [])
 if (not sources) and (len(df) > 0):
     tmp = (
@@ -298,6 +271,7 @@ with st.expander(f"データソース（{len(sources)}件）", expanded=False):
 if mode == "📑 シート別一覧":
     st.subheader("シート別一覧")
 
+    # スプレッドシートのプルダウン（すべて or 個別）
     ss_options = (
         df[["スプレッドシート", "ファイルID"]]
         .dropna()
@@ -314,6 +288,7 @@ if mode == "📑 シート別一覧":
     else:
         df_view = df[df["スプレッドシート"] == selected_ss]
 
+    # シート単位に集計（件数は計算するが表示には使わない）
     grp = (
         df_view.groupby(["スプレッドシート", "ファイルID", "シート名", "シートGID"])
               .size().reset_index(name="レコード数")
@@ -324,8 +299,11 @@ if mode == "📑 シート別一覧":
         st.info("該当データがありません。")
         st.stop()
 
+    # スプレッドシートごとにまとめて表示
     for (ss_name, file_id), chunk in grp.groupby(["スプレッドシート", "ファイルID"]):
         with st.expander(f"{ss_name}（{len(chunk)}シート）", expanded=False):
+
+            # 各シートの行
             for _, r in chunk.iterrows():
                 gid = r["シートGID"]
                 if pd.notna(gid):
@@ -333,33 +311,33 @@ if mode == "📑 シート別一覧":
                 else:
                     url = f"https://docs.google.com/spreadsheets/d/{file_id}/edit"
 
-                # テーマのプレビュー（重複除外・最大3件）
+                # ▼ プレビューは「テーマ」を重複除去して上位表示
                 themes_series = (
                     df[(df["スプレッドシート"] == ss_name) & (df["シート名"] == r["シート名"])]
-                    ["テーマ"].fillna("").map(normalize)
+                    ["テーマ"]
+                    .fillna("")
+                    .map(normalize)
                 )
-                themes_uniq, seen = [], set()
+                # 空を除外して重複排除
+                themes_uniq = []
+                seen = set()
                 for t in themes_series:
                     if t and t not in seen:
                         seen.add(t)
                         themes_uniq.append(t)
-                    if len(themes_uniq) >= 3:
+                    if len(themes_uniq) >= 3:   # 表示数は必要に応じて調整
                         break
 
+                # 行の表示（リンク＋テーマのプレビュー）
                 st.markdown(f"- [{r['シート名']}]({url})")
                 if themes_uniq:
                     st.caption(" ／ ".join(themes_uniq))
 
-    st.stop()  # 一覧モード終了
+    st.stop()  # 一覧モードではここで終了
 
 # =============================================================================
-# 🔍 検索モード
+# 🔍 検索（検索モード）
 # =============================================================================
-# 検索コーパスの準備（BM25 は先に構築 / 埋め込みは遅延）
-corpus_texts = (df["検索用テキスト"].fillna("") + " " + df["コンテンツ名"].fillna("")).tolist()
-corpus_tokens = [tokenize_ja(t) for t in corpus_texts]
-bm25 = build_bm25(corpus_tokens)
-
 st.caption("🔎 キーワードを入力して検索")
 q = st.text_input(
     label="キーワードを入力",
@@ -374,22 +352,46 @@ if q != st.session_state.last_query:
     st.session_state.last_query = q
 
 if q:
+    # 検索準備（埋め込み＋BM25）※検索モードでのみ計算
+    def tokenize_ja(text: str) -> List[str]:
+        text = normalize(text)
+        toks = re.split(r"[ \u3000、。・,./!?！？\-\n\r\t]+", text)
+        return [t for t in toks if t]
+
+    @st.cache_data(show_spinner=False)
+    def build_bm25(corpus_tokens: List[List[str]]):
+        return BM25Okapi(corpus_tokens)
+
+    @st.cache_resource(show_spinner=True)
+    def load_embedder():
+        return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+
+    corpus_texts = (df["検索用テキスト"].fillna("") + " " + df["コンテンツ名"].fillna("")).tolist()
+    corpus_tokens = [tokenize_ja(t) for t in corpus_texts]
+    bm25 = build_bm25(corpus_tokens)
+    embedder = load_embedder()
+    corpus_emb = embedder.encode(corpus_texts, normalize_embeddings=True, show_progress_bar=False)
+
+    SYNONYMS = {
+        "発表": ["プレゼン", "スピーチ", "表現", "発表練習"],
+        "表現": ["発表", "伝える", "アウトプット"],
+        "協力": ["協働", "チーム", "グループ", "共同"],
+        "創作": ["ものづくり", "制作", "工作", "クリエイティブ"],
+        "読解": ["読み取り", "感想", "読書", "朗読"],
+    }
+
     expanded = [q]
     for k, vs in SYNONYMS.items():
         if k in q:
             expanded += vs
     q_expanded = " ".join(expanded)
 
-    # BM25
     q_toks = tokenize_ja(q_expanded)
     bm25_scores = bm25.get_scores(q_toks)
 
-    # ★ 埋め込みはここで初めて実行（＋24h キャッシュ）
-    corpus_emb = embed_corpus(corpus_texts)
-    q_emb = load_embedder().encode([q_expanded], normalize_embeddings=True, show_progress_bar=False)
+    q_emb = embedder.encode([q_expanded], normalize_embeddings=True, show_progress_bar=False)
     sem_scores = util.cos_sim(q_emb, corpus_emb).cpu().numpy()[0]
 
-    # スコア正規化
     def minmax(x):
         x = np.array(x, dtype=float)
         if x.max() - x.min() < 1e-9:
@@ -400,7 +402,7 @@ if q:
     sem_n  = minmax(sem_scores)
     final  = alpha * sem_n + (1 - alpha) * bm25_n
 
-    # 上位 top_k まで取得（段階表示で伸ばせる上限）
+    # 上位 top_k まで取得（ここまで段階表示で増やせる）
     idx_all = np.argsort(final)[::-1][:top_k]
 
     # いま表示する件数（15件ずつ増える）
@@ -411,6 +413,8 @@ if q:
 
     for rank, i in enumerate(idx, start=1):
         row = df.iloc[i]
+
+        # gid があれば特定タブへ直リンク
         gid = row.get("シートGID")
         fid = row["ファイルID"]
         if pd.notna(gid):
@@ -418,28 +422,26 @@ if q:
         else:
             url = f"https://docs.google.com/spreadsheets/d/{fid}/edit"
 
-        cols = st.columns(1 if is_mobile else 3)
-
         with st.container(border=True):
             st.markdown(
                 f"**{rank}. {row.get('コンテンツ名','(名称未設定)')}** 　"
                 f"[{row['スプレッドシート']} / {row['シート名']}]({url})"
             )
+            cols = st.columns(3)
             with cols[0]:
                 st.write("**テーマ**:", row.get("テーマ",""))
                 st.write("**対象**:", row.get("対象",""))
                 st.write("**参加人数**:", row.get("参加人数",""))
-            if not is_mobile:
-                with cols[1]:
-                    st.write("**準備物**:", row.get("準備物",""))
-                    st.write("**実施方法**:", row.get("実施方法",""))
-                with cols[2]:
-                    st.write("**子供たちの反応**:", row.get("子供たちの反応",""))
-                    st.write("**良かった点**:", row.get("良かった点",""))
-                    st.write("**改善点**:", row.get("改善点",""))
+            with cols[1]:
+                st.write("**準備物**:", row.get("準備物",""))
+                st.write("**実施方法**:", row.get("実施方法",""))
+            with cols[2]:
+                st.write("**子供たちの反応**:", row.get("子供たちの反応",""))
+                st.write("**良かった点**:", row.get("良かった点",""))
+                st.write("**改善点**:", row.get("改善点",""))
             st.caption(f"score={final[i]:.3f} / semantic={sem_n[i]:.3f} / bm25={bm25_n[i]:.3f}")
 
-    # さらに表示
+    # --- さらに表示ボタン ---
     if show_n < len(idx_all):
         c1, c2, _ = st.columns([1, 1, 6])
         if c1.button("さらに表示（+15）"):
